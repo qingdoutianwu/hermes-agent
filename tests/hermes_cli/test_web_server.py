@@ -809,6 +809,38 @@ class TestWebServerEndpoints:
         resp = self.client.post("/api/gateway/drain", json={"action": "explode"})
         assert resp.status_code == 400
 
+    def test_gateway_drain_actions_cannot_overwrite_or_cancel_scheduler_maintenance(self):
+        import os
+
+        import gateway.drain_control as drain_control
+        from gateway.status import get_process_start_time
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+        fence = drain_control.acquire_scheduler_maintenance_fence(
+            owner="dashboard-route-test",
+            purpose="verify generic drain route cannot release maintenance",
+            scheduler_owner_identity={
+                "gateway_python_pid": os.getpid(),
+                "gateway_process_started_at": str(get_process_start_time(os.getpid())),
+                "binding_id": "route-fixture",
+                "launch_agent_sha256": "e" * 64,
+            },
+            home=home,
+            tick_lock_homes=[home],
+        )
+        proof = drain_control.read_scheduler_maintenance_proof(fence["proof_path"], home=home)
+        try:
+            cancel = self.client.post("/api/gateway/drain", json={"action": "cancel"})
+            begin = self.client.post("/api/gateway/drain", json={"action": "drain"})
+            assert cancel.status_code == 409
+            assert begin.status_code == 409
+            assert drain_control.scheduler_dispatch_blocked(home=home) is True
+        finally:
+            drain_control.release_scheduler_maintenance_fence(
+                fence["proof_path"], owner=proof["owner"], nonce=proof["nonce"], home=home,
+            )
+
 
 
 

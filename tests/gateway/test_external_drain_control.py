@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -326,3 +326,129 @@ class TestNewTurnGate:
         assert result is not None
         assert "draining" in result.lower()
 
+
+class TestSchedulerMaintenanceFence:
+    @staticmethod
+    def _owner_identity():
+        from gateway.status import get_process_start_time
+        import os
+
+        return {
+            "gateway_python_pid": os.getpid(),
+            "gateway_process_started_at": str(get_process_start_time(os.getpid())),
+            "binding_id": "legacy-fixture",
+            "launch_agent_sha256": "a" * 64,
+        }
+
+    def _acquire(self, home, *, ttl=dc.SCHEDULER_MAINTENANCE_TTL_SECONDS):
+        return dc.acquire_scheduler_maintenance_fence(
+            owner="r3c-test-owner",
+            purpose="isolated scheduler maintenance regression",
+            scheduler_owner_identity=self._owner_identity(),
+            home=home,
+            ttl_seconds=ttl,
+            tick_lock_homes=[home],
+        )
+
+    def test_fence_blocks_dispatch_without_turning_into_chat_drain_and_owner_releases(self, home, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        version = home / "runtime" / "scheduler-core" / "versions" / "legacy-fixture"
+        version.mkdir(parents=True)
+        current = home / "runtime" / "scheduler-core" / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(version, target_is_directory=True)
+        monkeypatch.setattr(dc, "_current_scheduler_tick_homes", lambda: [home.resolve()])
+
+        acquired = self._acquire(home)
+        proof = dc.read_scheduler_maintenance_proof(acquired["proof_path"], home=home)
+        assert "nonce" not in acquired
+        assert dc.active_scheduler_maintenance_fence(home=home)["maintenance_id"] == acquired["maintenance_id"]
+        assert dc.scheduler_dispatch_blocked(home=home) is True
+        assert dc.drain_requested(home=home) is False
+
+        runner = type("Runner", (), {
+            "_draining": False,
+            "_external_drain_active": False,
+            "_scheduler_maintenance_home": home,
+        })()
+        runner._cron_dispatch_allowed = GatewayRunner._cron_dispatch_allowed.__get__(runner, type(runner))
+        assert runner._cron_dispatch_allowed() is False
+        with pytest.raises(dc.MaintenanceFenceOwnershipError):
+            dc.clear_drain_request(home=home)
+
+        dc.update_scheduler_maintenance_fence_state(
+            acquired["proof_path"], owner=proof["owner"], nonce=proof["nonce"], state="DRAINING", home=home,
+        )
+        with patch("cron.scheduler.get_running_job_details", return_value=[
+            {"job_id": "running-a"}, {"job_id": "running-a"},
+        ]), patch.object(dc, "_current_scheduler_tick_homes", return_value=[home.resolve()]):
+            draining_ack = dc.sync_scheduler_maintenance_ack(home=home)
+        assert draining_ack["running_job_count"] == 2
+        assert draining_ack["running_job_ids"] == ["running-a", "running-a"]
+
+        dc.update_scheduler_maintenance_fence_state(
+            acquired["proof_path"], owner=proof["owner"], nonce=proof["nonce"], state="QUIESCED", home=home,
+        )
+        with patch("cron.scheduler.get_running_job_details", return_value=[]), patch.object(
+            dc, "_current_scheduler_tick_homes", return_value=[home.resolve()]
+        ):
+            quiet_ack = dc.sync_scheduler_maintenance_ack(home=home)
+        assert quiet_ack["running_job_count"] == 0
+        assert quiet_ack["scheduler_dispatch_blocked"] is True
+
+        with pytest.raises(dc.MaintenanceFenceOwnershipError):
+            dc.release_scheduler_maintenance_fence(
+                acquired["proof_path"], owner=proof["owner"], nonce="invalid-owner-token", home=home,
+            )
+        receipt = dc.release_scheduler_maintenance_fence(
+            acquired["proof_path"], owner=proof["owner"], nonce=proof["nonce"], home=home,
+        )
+        assert receipt["state"] == "RELEASED"
+        assert Path(receipt["receipt_path"]).stat().st_mode & 0o777 == 0o444
+        assert dc.scheduler_dispatch_blocked(home=home) is False
+        assert runner._cron_dispatch_allowed() is True
+
+    def test_expired_bounded_fence_reopens_dispatch_even_after_gateway_epoch_changes(self, home, monkeypatch):
+        from datetime import datetime, timedelta, timezone
+
+        acquired = self._acquire(home, ttl=30)
+        proof_path = Path(acquired["proof_path"])
+        proof_doc = json.loads(proof_path.read_text(encoding="utf-8"))
+        fence = proof_doc["fence"]
+        now = datetime.now(timezone.utc)
+        fence["created_at"] = (now - timedelta(seconds=31)).isoformat(timespec="microseconds")
+        fence["expires_at"] = (now - timedelta(seconds=1)).isoformat(timespec="microseconds")
+        fence["ttl_seconds"] = 30.0
+        fence["proof_sha256"] = dc._maintenance_proof_sha256(fence)
+        proof_path.write_text(json.dumps(proof_doc), encoding="utf-8")
+        proof_path.chmod(0o600)
+        marker = dc.read_drain_request(home=home)
+        marker["requested_at"] = fence["created_at"]
+        marker["scheduler_maintenance_fence"] = fence
+        dc.drain_request_path(home).write_text(json.dumps(marker), encoding="utf-8")
+        dc.drain_request_path(home).chmod(0o600)
+        monkeypatch.setattr(dc, "current_instantiation_epoch", lambda: "new-gateway-epoch")
+
+        assert dc.active_scheduler_maintenance_fence(home=home) is None
+        assert dc.scheduler_dispatch_blocked(home=home) is False
+
+    def test_tick_barrier_timeout_never_publishes_a_fence(self, home):
+        from cron import scheduler
+
+        cron_dir = home / "cron"
+        cron_dir.mkdir()
+        held = scheduler._acquire_tick_lock(cron_dir / ".tick.lock")
+        try:
+            with pytest.raises(dc.DrainControlBusyError, match="TICK_BARRIER_TIMEOUT"):
+                dc.acquire_scheduler_maintenance_fence(
+                    owner="r3c-test-owner",
+                    purpose="contended barrier fixture",
+                    scheduler_owner_identity=self._owner_identity(),
+                    home=home,
+                    tick_lock_homes=[home],
+                    tick_barrier_timeout_seconds=0.1,
+                )
+            assert dc.read_drain_request(home=home) is None
+        finally:
+            scheduler._release_tick_lock(held)

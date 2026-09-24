@@ -177,6 +177,15 @@ class CronScheduler(ABC):
     def claim_fire(self, job_id: str, *, force: bool = False, manual: bool = False) -> dict | None:
         """Durably claim one fire + create its audit attempt. Transports call this synchronously
         before acknowledging, then pass the exact snapshot to ``fire_claimed`` off-thread."""
+        from gateway.drain_control import scheduler_dispatch_admission
+
+        with scheduler_dispatch_admission() as admitted:
+            if not admitted:
+                return None
+            return self._claim_fire_admitted(job_id, force=force, manual=manual)
+
+    def _claim_fire_admitted(self, job_id: str, *, force: bool = False, manual: bool = False) -> dict | None:
+        """Create the claim while serialized against maintenance-fence publication."""
         from cron.executions import create_execution, finish_execution, set_execution_occurrence
         from cron.jobs import claim_job_for_fire
 

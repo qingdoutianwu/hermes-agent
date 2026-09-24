@@ -5630,8 +5630,12 @@ def _start_gateway_start_cron_and_housekeeping(runner):
 
     # Only the in-process ticker polls local due jobs, so only it gets the external-drain dispatch gate.
     if isinstance(cron_provider, InProcessCronScheduler):
-        cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active)
+        # The multiplex ticker changes Hermes-home scope while visiting profiles. Maintenance is
+        # one host-owner fence, so every profile callback must consult the stable launch home.
+            from hermes_constants import get_hermes_home
+
+            runner._scheduler_maintenance_home = Path(get_hermes_home()).expanduser().resolve()
+            cron_start_kwargs["can_dispatch"] = lambda: GatewayShutdownMixin._cron_dispatch_allowed(runner)
     # Supervised: a ticker that dies without a stop request is respawned by housekeeping (#111010).
     from cron.scheduler_thread import SupervisedTickerThread
     cron_thread = SupervisedTickerThread(

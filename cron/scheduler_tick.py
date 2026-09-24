@@ -43,7 +43,11 @@ def _tick_admitted(
             if _estop_check_paused("cron", _sched.logger):
                 return 0
 
-        if can_dispatch is not None and not can_dispatch():
+        if can_dispatch is None:
+            from gateway.drain_control import scheduler_dispatch_blocked
+
+            can_dispatch = lambda: not scheduler_dispatch_blocked()
+        if not can_dispatch():
             _sched.logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
 

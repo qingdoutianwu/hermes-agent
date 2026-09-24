@@ -776,6 +776,82 @@ class TestRunJobSessionPersistence:
         claim.assert_not_called()
         run_one.assert_not_called()
 
+    def test_tick_defers_due_occurrence_while_scheduler_maintenance_fence_is_active(self, tmp_path, monkeypatch):
+        """A real marker fence blocks the scan before due-state advancement or claim."""
+        from cron.scheduler import tick
+        import gateway.drain_control as drain_control
+        from gateway.status import get_process_start_time
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        owner = {
+            "gateway_python_pid": os.getpid(),
+            "gateway_process_started_at": str(get_process_start_time(os.getpid())),
+            "binding_id": "legacy-fixture",
+            "launch_agent_sha256": "b" * 64,
+        }
+        fence = drain_control.acquire_scheduler_maintenance_fence(
+            owner="cron-test",
+            purpose="verify due occurrence deferral",
+            scheduler_owner_identity=owner,
+            home=tmp_path,
+            tick_lock_homes=[tmp_path],
+        )
+        proof = drain_control.read_scheduler_maintenance_proof(fence["proof_path"], home=tmp_path)
+        job = {
+            "id": "paused-due-job",
+            "name": "paused due job",
+            "schedule": {"kind": "interval", "seconds": 60},
+            "next_run_at": "2020-01-01T00:00:00+00:00",
+            "enabled": True,
+        }
+        with patch("cron.scheduler._hermes_home", tmp_path), patch(
+            "cron.scheduler.get_due_jobs", return_value=[job]
+        ) as due, patch("cron.scheduler.advance_next_runs") as advance, patch(
+            "cron.scheduler.claim_job_for_fire"
+        ) as claim, patch("cron.scheduler.run_one_job") as run_one:
+            assert tick(verbose=False, sync=True) == 0
+
+        due.assert_not_called()
+        advance.assert_not_called()
+        claim.assert_not_called()
+        run_one.assert_not_called()
+        drain_control.release_scheduler_maintenance_fence(
+            fence["proof_path"], owner=proof["owner"], nonce=proof["nonce"], home=tmp_path,
+        )
+        assert drain_control.scheduler_dispatch_blocked(home=tmp_path) is False
+
+    def test_manual_fire_claim_is_rejected_before_creating_an_execution_during_fence(self, tmp_path, monkeypatch):
+        import os
+
+        from gateway.status import get_process_start_time
+        from cron.scheduler_provider import InProcessCronScheduler
+        import gateway.drain_control as drain_control
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        started = get_process_start_time(os.getpid())
+        fence = drain_control.acquire_scheduler_maintenance_fence(
+            owner="manual-fire-test",
+            purpose="verify manual admission fence",
+            scheduler_owner_identity={
+                "gateway_python_pid": os.getpid(),
+                "gateway_process_started_at": str(started),
+                "binding_id": "legacy-fixture",
+                "launch_agent_sha256": "c" * 64,
+            },
+            home=tmp_path,
+            tick_lock_homes=[tmp_path],
+        )
+        with patch("cron.executions.create_execution") as create, patch(
+            "cron.jobs.claim_job_for_fire"
+        ) as claim:
+            assert InProcessCronScheduler().claim_fire("manual-job") is None
+        create.assert_not_called()
+        claim.assert_not_called()
+        proof = drain_control.read_scheduler_maintenance_proof(fence["proof_path"], home=tmp_path)
+        drain_control.release_scheduler_maintenance_fence(
+            fence["proof_path"], owner=proof["owner"], nonce=proof["nonce"], home=tmp_path,
+        )
+
     def test_tick_marks_empty_response_as_error(self, tmp_path):
         """When run_job returns success=True but final_response is empty,
         tick() should mark the job as error so last_status != 'ok'.

@@ -181,6 +181,21 @@ class GatewayShutdownMixin:
             + self._active_deferred_agent_worker_count()
         )
 
+    def _cron_dispatch_allowed(self) -> bool:
+        """Check the durable drain marker at the tick boundary, before the async watcher runs."""
+        if self._draining or self._external_drain_active:
+            return False
+        try:
+            from gateway.drain_control import scheduler_dispatch_blocked
+
+            control_home = getattr(self, "_scheduler_maintenance_home", None)
+            return not scheduler_dispatch_blocked(home=control_home)
+        except Exception as exc:
+            # A maintenance fence is a dispatch safety boundary: an unreadable gate must not
+            # admit a tick. The marker reader itself is fail-closed; this is the import/error path.
+            logger.error("Cron dispatch gate unavailable; holding dispatch: %s", exc)
+            return False
+
     @staticmethod
     def _running_cron_job_count() -> int:
         # The FULL work aggregate, not _running_agent_count(): cron jobs run on the scheduler's own thread
@@ -715,11 +730,12 @@ class GatewayShutdownMixin:
 
     async def _drain_control_watcher(self, interval: float = 1.0) -> None:
         """Poll ``.drain_request.json`` at 1s: present -> enter drain, absent -> exit; a stale epoch = absent."""
-        from gateway.drain_control import drain_requested
+        from gateway.drain_control import drain_requested, sync_scheduler_maintenance_ack
         while self._running:
             try:
                 # Off-thread: a synchronous marker read at 1s cadence can stall 30s+ under host I/O
                 # pressure and take every platform heartbeat down.
+                await asyncio.to_thread(sync_scheduler_maintenance_ack)
                 if await asyncio.to_thread(drain_requested):
                     self._enter_external_drain()
                     # API and cron work live outside messaging's _running_agents map; refresh the

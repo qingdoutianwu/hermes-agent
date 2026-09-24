@@ -176,7 +176,13 @@ async def gateway_drain(request: Request):
     transition (the marker IS the control channel). Idempotent on both sides;
     ``POST /api/gateway/restart`` is the force-override that supersedes a drain.
     """
-    from gateway.drain_control import clear_drain_request, drain_requested, write_drain_request
+    from gateway.drain_control import (
+        DrainControlBusyError,
+        MaintenanceFenceOwnershipError,
+        clear_drain_request,
+        drain_requested,
+        write_drain_request,
+    )
 
     try:
         body = await request.json()
@@ -188,15 +194,24 @@ async def gateway_drain(request: Request):
     principal = getattr(getattr(request.state, "token_principal", None), "principal", None) or "dashboard"
 
     if action == "cancel":
-        existed = clear_drain_request()
+        try:
+            existed = clear_drain_request()
+        except MaintenanceFenceOwnershipError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="A scheduler maintenance fence can only be released by its owner token.",
+            ) from exc
         _log.info("Gateway drain CANCEL requested by %s (existed=%s)", principal, existed)
         return {"ok": True, "action": "cancel", "was_draining": existed}
     if action != "drain":
         raise HTTPException(status_code=400, detail=f"Unknown drain action {action!r}; expected 'drain' or 'cancel'")
 
-    payload = write_drain_request(
-        principal=str(principal), suppress_notification=bool(body.get("suppress_notification", False)),
-    )
+    try:
+        payload = write_drain_request(
+            principal=str(principal), suppress_notification=bool(body.get("suppress_notification", False)),
+        )
+    except DrainControlBusyError as exc:
+        raise HTTPException(status_code=409, detail="A scheduler maintenance fence is active.") from exc
     _log.info(
         "Gateway drain BEGIN requested by %s (suppress_notification=%s)", principal, payload["suppress_notification"],
     )
