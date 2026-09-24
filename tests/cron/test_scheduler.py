@@ -783,6 +783,11 @@ class TestRunJobSessionPersistence:
         from gateway.status import get_process_start_time
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            drain_control,
+            "_wait_for_scheduler_maintenance_dispatch_observation",
+            lambda *_args, **_kwargs: {"source": "TEST_FIXTURE", "scheduler_dispatch_blocked": True},
+        )
         owner = {
             "gateway_python_pid": os.getpid(),
             "gateway_process_started_at": str(get_process_start_time(os.getpid())),
@@ -828,6 +833,11 @@ class TestRunJobSessionPersistence:
         import gateway.drain_control as drain_control
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            drain_control,
+            "_wait_for_scheduler_maintenance_dispatch_observation",
+            lambda *_args, **_kwargs: {"source": "TEST_FIXTURE", "scheduler_dispatch_blocked": True},
+        )
         started = get_process_start_time(os.getpid())
         fence = drain_control.acquire_scheduler_maintenance_fence(
             owner="manual-fire-test",

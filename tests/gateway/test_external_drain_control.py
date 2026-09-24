@@ -340,7 +340,13 @@ class TestSchedulerMaintenanceFence:
             "launch_agent_sha256": "a" * 64,
         }
 
-    def _acquire(self, home, *, ttl=dc.SCHEDULER_MAINTENANCE_TTL_SECONDS):
+    def _acquire(self, home, *, ttl=dc.SCHEDULER_MAINTENANCE_TTL_SECONDS, monkeypatch=None):
+        if monkeypatch is not None:
+            monkeypatch.setattr(
+                dc,
+                "_wait_for_scheduler_maintenance_dispatch_observation",
+                lambda *_args, **_kwargs: {"source": "TEST_FIXTURE", "scheduler_dispatch_blocked": True},
+            )
         return dc.acquire_scheduler_maintenance_fence(
             owner="r3c-test-owner",
             purpose="isolated scheduler maintenance regression",
@@ -360,7 +366,7 @@ class TestSchedulerMaintenanceFence:
         current.symlink_to(version, target_is_directory=True)
         monkeypatch.setattr(dc, "_current_scheduler_tick_homes", lambda: [home.resolve()])
 
-        acquired = self._acquire(home)
+        acquired = self._acquire(home, monkeypatch=monkeypatch)
         proof = dc.read_scheduler_maintenance_proof(acquired["proof_path"], home=home)
         assert "nonce" not in acquired
         assert dc.active_scheduler_maintenance_fence(home=home)["maintenance_id"] == acquired["maintenance_id"]
@@ -412,7 +418,7 @@ class TestSchedulerMaintenanceFence:
     def test_expired_bounded_fence_reopens_dispatch_even_after_gateway_epoch_changes(self, home, monkeypatch):
         from datetime import datetime, timedelta, timezone
 
-        acquired = self._acquire(home, ttl=30)
+        acquired = self._acquire(home, ttl=30, monkeypatch=monkeypatch)
         proof_path = Path(acquired["proof_path"])
         proof_doc = json.loads(proof_path.read_text(encoding="utf-8"))
         fence = proof_doc["fence"]
@@ -452,3 +458,25 @@ class TestSchedulerMaintenanceFence:
             assert dc.read_drain_request(home=home) is None
         finally:
             scheduler._release_tick_lock(held)
+
+    def test_old_gateway_external_drain_status_is_fresh_owner_bound_gate_evidence(self, home):
+        import os
+        from datetime import datetime, timezone
+
+        identity = self._owner_identity()
+        status_path = home / "gateway_state.json"
+        status_path.write_text(json.dumps({
+            "pid": os.getpid(),
+            "start_time": identity["gateway_process_started_at"],
+            "hermes_home": str(home.resolve()),
+            "gateway_state": "draining",
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+        }), encoding="utf-8")
+        status_path.chmod(0o600)
+        evidence = dc._legacy_external_drain_attestation(
+            home,
+            {"scheduler_owner_identity": identity},
+        )
+        assert evidence is not None
+        assert evidence["source"] == "LEGACY_EXTERNAL_DRAIN_STATUS"
+        assert evidence["scheduler_dispatch_blocked"] is True

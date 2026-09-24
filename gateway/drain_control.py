@@ -42,14 +42,14 @@ _DRAIN_REQUEST_FILENAME = ".drain_request.json"
 # Max-age fallback for a same-epoch orphaned marker (#85433). Long-running drains refresh the marker via
 # write_drain_request() (idempotent re-write bumps ``requested_at``) rather than raising this bound.
 DRAIN_REQUEST_MAX_AGE_SECONDS = 3600.0
-# Scheduler maintenance is a bounded lease. 300s covers the activation's 45s service
-# waits, fresh-ticker readback and the non-business identity fixture, while still
-# automatically reopening dispatch if the controller disappears.
+# Scheduler maintenance is bounded by the existing external-drain orphan window. A Gateway
+# already running the previous build interprets this marker through the generic drain path and
+# expires it after one hour; matching that existing ceiling keeps restart compatibility bounded.
 SCHEDULER_MAINTENANCE_FENCE_SCHEMA = "hermes-scheduler-maintenance-fence-v1"
 SCHEDULER_MAINTENANCE_PROOF_SCHEMA = "hermes-scheduler-maintenance-proof-v1"
 SCHEDULER_MAINTENANCE_ACK_SCHEMA = "hermes-scheduler-maintenance-ack-v1"
 SCHEDULER_MAINTENANCE_RECEIPT_SCHEMA = "hermes-scheduler-maintenance-receipt-v1"
-SCHEDULER_MAINTENANCE_TTL_SECONDS = 300.0
+SCHEDULER_MAINTENANCE_TTL_SECONDS = DRAIN_REQUEST_MAX_AGE_SECONDS
 SCHEDULER_MAINTENANCE_MIN_TTL_SECONDS = 30.0
 _DRAIN_MARKER_LOCK_TIMEOUT_SECONDS = 2.0
 _SCHEDULER_TICK_BARRIER_TIMEOUT_SECONDS = 10.0
@@ -603,6 +603,17 @@ def acquire_scheduler_maintenance_fence(
                 with contextlib.suppress(OSError):
                     proof_path.unlink()
                 raise
+        gate_observation = _wait_for_scheduler_maintenance_dispatch_observation(
+            home_path, fence, timeout_seconds=barrier_timeout,
+        )
+        if gate_observation is None:
+            release_scheduler_maintenance_fence(
+                proof_path,
+                owner=fence_owner,
+                nonce=fence["nonce"],
+                home=home_path,
+            )
+            raise DrainControlError("E_MAINTENANCE_FENCE_DISPATCH_NOT_BLOCKED")
     return {
         "maintenance_id": maintenance_id,
         "owner": fence_owner,
@@ -614,6 +625,7 @@ def acquire_scheduler_maintenance_fence(
         "proof_sha256": fence["proof_sha256"],
         "proof_path": str(proof_path),
         "fence_directory": str(proof_dir),
+        "dispatch_gate_observation": gate_observation,
     }
 
 
@@ -651,6 +663,90 @@ def update_scheduler_maintenance_fence_state(
         atomic_json_write(proof_file, proof_payload, mode=0o600, fsync_dir=True)
         atomic_json_write(marker_path, marker, mode=0o600, fsync_dir=True)
     return {key: value for key, value in fence.items() if key != "nonce"}
+
+
+def _legacy_external_drain_attestation(home: Path, fence: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Read the old Gateway's native drain acknowledgment during its one upgrade restart."""
+    status_path = home / "gateway_state.json"
+    try:
+        info = status_path.lstat()
+        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+                or stat.S_IMODE(info.st_mode) != 0o600):
+            return None
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(status, dict) or status.get("gateway_state") != "draining":
+        return None
+    identity = fence["scheduler_owner_identity"]
+    try:
+        if (int(status.get("pid")) != int(identity["gateway_python_pid"])
+                or str(status.get("start_time")) != str(identity["gateway_process_started_at"])
+                or Path(str(status.get("hermes_home") or "")).expanduser().resolve(strict=True) != home.resolve(strict=True)):
+            return None
+        updated_at = _parse_iso(status.get("updated_at"))
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+    if updated_at is None:
+        return None
+    age = (datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc)).total_seconds()
+    if age < -5 or age > 10:
+        return None
+    return {
+        "source": "LEGACY_EXTERNAL_DRAIN_STATUS",
+        "gateway_pid": int(status["pid"]),
+        "gateway_process_started_at": str(status["start_time"]),
+        "gateway_state": "draining",
+        "observed_at": str(status["updated_at"]),
+        "age_seconds": round(age, 3),
+        "scheduler_dispatch_blocked": True,
+    }
+
+
+def _wait_for_scheduler_maintenance_dispatch_observation(
+    home: Path,
+    fence: dict[str, Any],
+    *,
+    timeout_seconds: float = _SCHEDULER_TICK_BARRIER_TIMEOUT_SECONDS,
+) -> Optional[dict[str, Any]]:
+    """Wait while tick locks are held for either new ACK or legacy Gateway drain status."""
+    deadline = time.monotonic() + timeout_seconds
+    ack_path = scheduler_maintenance_ack_path(home, fence["maintenance_id"])
+    while time.monotonic() < deadline:
+        try:
+            info = ack_path.lstat()
+            if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o600:
+                ack = json.loads(ack_path.read_text(encoding="utf-8"))
+                identity = fence["scheduler_owner_identity"]
+                if (isinstance(ack, dict)
+                        and ack.get("schema_version") == SCHEDULER_MAINTENANCE_ACK_SCHEMA
+                        and ack.get("maintenance_id") == fence["maintenance_id"]
+                        and ack.get("proof_sha256") == fence["proof_sha256"]
+                        and ack.get("fence_state") == fence["state"]
+                        and ack.get("scheduler_dispatch_blocked") is True
+                        and ack.get("scheduler_tick_home_roster_matches") is True
+                        and ack.get("scheduler_tick_homes") == fence["scheduler_tick_homes"]
+                        and int(ack.get("gateway_pid")) == int(identity["gateway_python_pid"])
+                        and str(ack.get("gateway_process_started_at")) == str(identity["gateway_process_started_at"])):
+                    observed = _parse_iso(ack.get("observed_at"))
+                    age = (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds() if observed else 1e9
+                    if -5 <= age <= 10:
+                        return {
+                            "source": "GATEWAY_MAINTENANCE_ACK",
+                            "gateway_pid": int(ack["gateway_pid"]),
+                            "gateway_process_started_at": str(ack["gateway_process_started_at"]),
+                            "gateway_state": None,
+                            "observed_at": str(ack["observed_at"]),
+                            "age_seconds": round(age, 3),
+                            "scheduler_dispatch_blocked": True,
+                        }
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+        legacy = _legacy_external_drain_attestation(home, fence)
+        if legacy is not None:
+            return legacy
+        time.sleep(0.1)
+    return None
 
 
 def sync_scheduler_maintenance_ack(*, home: Optional[Path] = None) -> Optional[dict[str, Any]]:

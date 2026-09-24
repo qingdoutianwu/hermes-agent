@@ -809,7 +809,7 @@ class TestWebServerEndpoints:
         resp = self.client.post("/api/gateway/drain", json={"action": "explode"})
         assert resp.status_code == 400
 
-    def test_gateway_drain_actions_cannot_overwrite_or_cancel_scheduler_maintenance(self):
+    def test_gateway_drain_actions_cannot_overwrite_or_cancel_scheduler_maintenance(self, monkeypatch):
         import os
 
         import gateway.drain_control as drain_control
@@ -817,6 +817,11 @@ class TestWebServerEndpoints:
         from hermes_constants import get_hermes_home
 
         home = get_hermes_home()
+        monkeypatch.setattr(
+            drain_control,
+            "_wait_for_scheduler_maintenance_dispatch_observation",
+            lambda *_args, **_kwargs: {"source": "TEST_FIXTURE", "scheduler_dispatch_blocked": True},
+        )
         fence = drain_control.acquire_scheduler_maintenance_fence(
             owner="dashboard-route-test",
             purpose="verify generic drain route cannot release maintenance",
