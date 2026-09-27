@@ -417,7 +417,7 @@ def _run_job_script(
             authority.close_child_in_parent()
         deadline = time.monotonic() + script_timeout
         while True:
-            if authority is not None:
+            if authority is not None and isinstance(getattr(proc, "pid", None), int):
                 authority.poll(proc.pid)
             # Tree-kill on cancel AND timeout: killpg misses setsid grandchildren (watchdogs,
             # backgrounded shell jobs); kill_process_tree snapshots descendants BEFORE signalling.

@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from cron.scheduler_origin_auth import ORIGIN, ScriptOriginAuthority, authoritative_environment, scrub_identity
 
 
@@ -186,3 +188,51 @@ def test_gateway_side_close_revokes_unverified_authority():
         assert authority.child.recv(1) == b""
     finally:
         authority.close()
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"execution_id": "unknown"},
+        {"job_id": "other"},
+        {"origin": "MANUAL"},
+        {"scheduled_at": "2026-09-27T07:00:00+08:00"},
+        {"pid": -1},
+        {"nonce": "bad"},
+    ],
+)
+def test_mismatched_request_is_rejected_once(monkeypatch, override):
+    job = _job()
+    monkeypatch.setattr("cron.executions.get_execution", lambda _id: _row(job))
+    authority = ScriptOriginAuthority(job)
+    try:
+        authority.child.sendall((json.dumps(_request(job) | override) + "\n").encode())
+        authority.poll(os.getpid())
+        assert json.loads(authority.child.recv(2048))["status"] == "REJECTED"
+        assert authority.child.recv(1) == b""
+    finally:
+        authority.close()
+
+
+def test_spawn_failure_closes_both_authority_endpoints(tmp_path: Path, monkeypatch):
+    """The subprocess error path cannot leave an active proof channel."""
+    import cron.scheduler_script as script
+    import cron.scheduler_origin_auth as auth
+
+    created = []
+    real = auth.ScriptOriginAuthority
+
+    def capture(job):
+        value = real(job)
+        created.append(value)
+        return value
+
+    monkeypatch.setattr(auth, "ScriptOriginAuthority", capture)
+    monkeypatch.setattr("cron.scheduler_script._resolve_script_path", lambda _path: (tmp_path / "probe.py", None))
+    monkeypatch.setattr("cron.scheduler_script._script_argv", lambda _path: (["nonexistent-auth2-executable"], {}, None))
+    monkeypatch.setattr(script.subprocess, "Popen", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("spawn failed")))
+    ok, message = script._run_job_script("probe.py", job=_job())
+    assert not ok and "spawn failed" in message
+    assert len(created) == 1
+    assert created[0].parent.fileno() == -1
+    assert created[0].child.fileno() == -1
