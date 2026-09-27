@@ -429,9 +429,37 @@ def _script_argv(
     return [python_exe, str(path)], env_overlay, None
 
 
+def _pin_sealed_scheduler_child_import_root(env: dict[str, str]) -> None:
+    """Preserve the active sealed core's existing child-import binding."""
+
+    import hashlib
+    import json
+    import hermes_constants
+
+    repo_root = Path(hermes_constants.__file__).resolve().parent
+    core_root = Path(__file__).resolve().parents[1]
+    manifest_path = core_root / "scheduler-core-manifest.json"
+    if not manifest_path.is_file():
+        return  # source-tree isolated tests have no sealed manifest
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("version_id") != core_root.name:
+        raise RuntimeError("E_SCHEDULER_CORE_CHILD_VERSION")
+    module = core_root / str(manifest.get("scheduler_module_path") or "")
+    if not module.is_file() or hashlib.sha256(module.read_bytes()).hexdigest() != manifest.get("scheduler_module_sha256"):
+        raise RuntimeError("E_SCHEDULER_CORE_CHILD_MODULE_IDENTITY")
+    if not (repo_root / "hermes_cli" / "main.py").is_file():
+        raise RuntimeError("E_SCHEDULER_CORE_HOST_ROOT")
+    env["PYTHONPATH"] = os.pathsep.join((str(core_root), str(repo_root)))
+    env["HERMES_SCHEDULER_CORE_VERSION_ID"] = str(manifest["version_id"])
+    env["HERMES_SCHEDULER_CORE_MODULE_PATH"] = str(module)
+    env["HERMES_SCHEDULER_CORE_MODULE_SHA256"] = str(manifest["scheduler_module_sha256"])
+
+
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
-    cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None,
+    interpreter: Optional[str] = None,
+    *, job: Optional[dict[str, Any]] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -448,6 +476,7 @@ def _run_job_script(
     if path is None:
         return False, err
     script_timeout = _get_script_timeout()
+    authority = None
     try:
         argv, env_overlay, err = _script_argv(path, interpreter)
         if argv is None:
@@ -480,6 +509,14 @@ def _run_job_script(
         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
+        _pin_sealed_scheduler_child_import_root(env)
+        from cron.scheduler_origin_auth import ScriptOriginAuthority, authoritative_environment, scrub_identity
+
+        scrub_identity(env)
+        if job and sys.platform == "darwin" and job.get("execution_id") and job.get("_scheduled_instant"):
+            authority = ScriptOriginAuthority(job)
+            authoritative_environment(env, authority)
+            popen_kwargs["pass_fds"] = (authority.child_fd,)
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -487,8 +524,12 @@ def _run_job_script(
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=workdir or str(path.parent), env=env, **popen_kwargs)
+        if authority is not None:
+            authority.close_child_in_parent()
         deadline = time.monotonic() + script_timeout
         while True:
+            if authority is not None:
+                authority.poll(proc.pid)
             # Tree-kill on cancel AND timeout: killpg misses setsid grandchildren (watchdogs,
             # backgrounded shell jobs); kill_process_tree snapshots descendants BEFORE signalling.
             if cancel_event is not None and cancel_event.is_set():
@@ -534,6 +575,9 @@ def _run_job_script(
         return True, stdout
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
+    finally:
+        if authority is not None:
+            authority.close()
 
 
 def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.Thread]:
@@ -560,7 +604,7 @@ def _run_job_script_with_claim_heartbeat(
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
     def run() -> tuple[bool, str]:
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"))
+                               interpreter=job.get("interpreter"), job=job)
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")
