@@ -168,22 +168,25 @@ async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, t
     """One text chunk with adapter-matching fallbacks: thread-not-found -> retry without
     ``message_thread_id`` (dropped from ``text_kwargs`` for later chunks too); parse failure
     -> plain text."""
+    thread_fallback = False
+
     async def send(text, mode):
         return await _send_telegram_message_with_retry(bot, chat_id=chat_id, text=text, parse_mode=mode, **text_kwargs)
     try:
-        return await send(chunk, parse_mode)
+        return await send(chunk, parse_mode), thread_fallback
     except Exception as md_error:
         # Thread not found — retry without message_thread_id so the message still delivers (matching the
         # gateway adapter's fallback behaviour, issue #27012).
         if _is_telegram_thread_not_found(md_error) and text_kwargs.get("message_thread_id") is not None:
             logger.warning("Thread %s not found in _send_telegram, retrying without message_thread_id",
                            text_kwargs.pop("message_thread_id"))
-            return await send(chunk, parse_mode)
+            thread_fallback = True
+            return await send(chunk, parse_mode), thread_fallback
         err_text = str(md_error).lower()
         if "parse" in err_text or "markdown" in err_text or "html" in err_text:
             logger.warning("Parse mode %s failed in _send_telegram, falling back to plain text: %s",
                            parse_mode, _sanitize_error_text(md_error))
-            return await send(chunk if has_html else _strip_mdv2_safe(chunk), None)
+            return await send(chunk if has_html else _strip_mdv2_safe(chunk), None), thread_fallback
         raise
 
 
@@ -270,6 +273,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         # disable_web_page_preview is only valid for send_message, not media sends.
         text_kwargs = {**thread_kwargs, **({"disable_web_page_preview": True} if disable_link_previews else {})}
         last_msg, warnings, _tg_caption = None, [], None
+        thread_fallback = False
         # MEDIA caption rides on the bubble as its *formatted* caption; formatting can inflate a
         # raw <1024 string past Telegram's cap, so re-check in UTF-16 units.
         _cap, _ = _media_caption_split(message, media_files, max_caption_len=_TELEGRAM_CAPTION_LIMIT)
@@ -277,7 +281,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             _tg_caption, formatted = formatted, ""  # suppress the separate text send below
         # Chunk *after* formatting, in UTF-16 units: escaping can push a raw-<4096 message over.
         for chunk in BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len) if formatted.strip() else ():
-            last_msg = await _telegram_send_text_chunk(bot, int_chat_id, chunk, send_parse_mode, _has_html, text_kwargs)
+            last_msg, chunk_thread_fallback = await _telegram_send_text_chunk(
+                bot, int_chat_id, chunk, send_parse_mode, _has_html, text_kwargs)
+            thread_fallback = thread_fallback or chunk_thread_fallback
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):
                 warnings.append(f"Media file not found, skipping: {media_path}")
@@ -301,7 +307,32 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 logger.error(warnings[-1])
         if last_msg is None:
             return {"error": _NO_DELIVERABLE, **({"warnings": warnings} if warnings else {})}
-        return _success("telegram", chat_id, warnings, message_id=str(last_msg.message_id))
+        response_thread_id = getattr(last_msg, "message_thread_id", None)
+        if response_thread_id is not None:
+            try:
+                response_thread_id = int(response_thread_id)
+            except (TypeError, ValueError):
+                response_thread_id = None
+        requested_thread_id = None if thread_id is None else int(thread_id)
+        if requested_thread_id is None:
+            route_confirmation = "no_thread_requested"
+        elif response_thread_id == requested_thread_id:
+            route_confirmation = "response_thread"
+        elif response_thread_id is None and not thread_fallback:
+            route_confirmation = "requested_thread_no_fallback"
+        else:
+            route_confirmation = "missing_or_mismatched_thread"
+        return _success(
+            "telegram",
+            chat_id,
+            warnings,
+            message_id=str(last_msg.message_id),
+            message_thread_id=response_thread_id,
+            requested_thread_id=requested_thread_id,
+            response_thread_id=response_thread_id,
+            thread_fallback=bool(thread_fallback),
+            route_confirmation=route_confirmation,
+        )
     except ImportError:
         return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}
     except Exception as e:
