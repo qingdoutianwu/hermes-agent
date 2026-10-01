@@ -585,6 +585,7 @@ _TOPLEVEL_BOOL_DEFAULTS = {
 @dataclass
 class GatewayConfig:
     """Main gateway configuration: platform connections, session policies, delivery settings."""
+    startup_isolation: bool = False
     platforms: Dict[Platform, PlatformConfig] = field(default_factory=dict)
     reset_triggers: List[str] = field(default_factory=lambda: ["/new", "/reset"])
     quick_commands: Dict[str, Any] = field(default_factory=dict)  # slash commands that bypass the agent loop
@@ -645,6 +646,7 @@ class GatewayConfig:
 
     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
     _SCALAR_DICT_FIELDS = (
+        "startup_isolation",
         "write_sessions_json", "always_log_local", "filter_silence_narration", "stt_enabled",
         "stt_echo_transcripts", "group_sessions_per_user", "thread_sessions_per_user",
         "max_concurrent_sessions", "multiplex_profiles",
@@ -725,6 +727,9 @@ class GatewayConfig:
     def from_dict(cls, data: Dict[str, Any]) -> "GatewayConfig":
         data = _coerce_dict(data)
         nested_gateway = _coerce_dict(data.get("gateway"))
+        from gateway.startup_isolation import parse as parse_startup_isolation
+        isolation_value = data.get("startup_isolation", nested_gateway.get("startup_isolation", False))
+        isolation_value = parse_startup_isolation(isolation_value)
 
         def pick(key: str) -> Any:
             """Top-level key wins by presence; else the nested ``gateway.<key>`` form."""
@@ -803,6 +808,7 @@ class GatewayConfig:
             multiplex_profiles=None if multiplex_profiles is None else _coerce_bool(multiplex_profiles, True),
             room_link_url=room_link_url if isinstance(room_link_url, str) else None,
             systemd_watchdog_seconds=systemd_watchdog_seconds,
+            startup_isolation=isolation_value,
             loop_watchdog=_coerce_bool(pick("loop_watchdog"), True),
             loop_watchdog_probe_interval_s=bounded_float("loop_watchdog_probe_interval_s", DEFAULT_LOOP_WATCHDOG_INTERVAL_S, 1.0, 3600.0),
             loop_watchdog_probe_timeout_s=bounded_float("loop_watchdog_probe_timeout_s", DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, 1.0, 600.0),

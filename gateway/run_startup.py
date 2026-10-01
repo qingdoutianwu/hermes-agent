@@ -91,6 +91,9 @@ class GatewayStartupMixin:
 
     async def _drain_startup_restore_queue(self) -> int:
         """Replay inbound messages queued while startup auto-resume ran."""
+        from gateway.startup_isolation import allowed
+        if not allowed("replay"):
+            return 0
         drained = 0
         queue = getattr(self, "_startup_restore_queue", None) or []
         while queue:
@@ -268,6 +271,9 @@ class GatewayStartupMixin:
         ``_send_restart_notification`` and ``_redeliver_pending_obligations`` used to be awaited inline
         *before* ``_finish_startup_restore`` released the gate. See #91969.
         """
+        from gateway.startup_isolation import allowed
+        if not allowed("pending_send"):
+            return
         from gateway.run import _startup_restore_drain_timeout_secs
         claimed = await self._claim_pending_obligations()
 
@@ -577,6 +583,9 @@ class GatewayStartupMixin:
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
         sessions with a running agent are skipped so none is resumed twice."""
+        from gateway.startup_isolation import allowed
+        if not allowed("recovery"):
+            return 0
         from gateway.run import (
             _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window, _is_fresh_gateway_interruption,
         )
@@ -716,6 +725,9 @@ class GatewayStartupMixin:
         finished its turn (the marker is held until the reply is ledgered), so nothing re-runs it —
         the old 120 s recency sweep re-answered every recently active chat. Returns (resumed,
         ledgered)."""
+        from gateway.startup_isolation import allowed
+        if not allowed("recovery"):
+            return 0, 0
         from gateway.run import _float_env
         resumed = ledgered = 0
         max_age = max(60 * 60, int(max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800)) * 2))
@@ -1113,6 +1125,9 @@ class GatewayStartupMixin:
 
     async def _start_recover_previous_run(self) -> None:
         """Plugins, relay, hooks, then crash/clean-exit recovery of processes and sessions."""
+        from gateway.startup_isolation import allowed
+        if not allowed("pending_tasks"):
+            return
         from gateway.run import _hermes_home
         self._start_register_plugins_relay_hooks()
         # Plugins that load later (force re-discovery, install/enable nudge) re-wire live adapters (#87770).
@@ -1161,6 +1176,9 @@ class GatewayStartupMixin:
     async def _start_prefilter_platforms(self) -> Tuple[bool, int, list, list]:
         """Create + wire an adapter per enabled platform (no connects). Returns
         (aborted, enabled_platform_count, multiplex_skipped_platforms, pending_connects)."""
+        from gateway.startup_isolation import allowed
+        if not allowed("adapters"):
+            return False, 0, [], []
         from gateway.run import _platform_has_bot_credential
         enabled_platform_count = 0
         _multiplex_on = self._multiplex_on()
@@ -1436,6 +1454,9 @@ class GatewayStartupMixin:
 
     async def _start_post_connect_services(self, connected_count: int) -> None:
         """Room worker, heartbeat, gateway:startup hook, channel directory, /update notice."""
+        from gateway.startup_isolation import allowed
+        if not allowed("notification"):
+            return
         from gateway.run import _hermes_home
         try:
             await self._ensure_hosted_room_worker()
@@ -1471,6 +1492,9 @@ class GatewayStartupMixin:
 
     async def _start_finish_wiring(self, connected_count: int) -> None:
         """Post-connect wiring: services, boot notifications, startup restore, recovered watchers."""
+        from gateway.startup_isolation import allowed
+        if not allowed("notification"):
+            return
         from gateway.run import _planned_restart_notification_pending, _restart_notification_pending
         await self._start_post_connect_services(connected_count)
         # Let fresh adapters settle before lifecycle sends (helps Discord thread deliveries).
@@ -1573,6 +1597,16 @@ class GatewayStartupMixin:
         logger.info("Starting Hermes Gateway...")
         self._start_install_faulthandler()
         await self._start_log_startup_environment()
+        from gateway import startup_isolation
+        if startup_isolation.enabled():
+            startup_isolation.verify()
+            self._running = True
+            self._startup_restore_in_progress = False
+            self.delivery_router.adapters = {}
+            self._update_runtime_status("running")
+            startup_isolation.write_receipt()
+            logger.info("Gateway startup isolation effective; recovery, replay, adapters and background dispatch fenced")
+            return True
         if await self._abort_startup_if_shutdown_requested():
             return True
         if self._start_check_access_policy():
@@ -1831,3 +1865,7 @@ class GatewayStartupMixin:
             raise RuntimeError(f"adapter.send failed: {exc}") from exc
         if not getattr(result, "success", True):
             raise RuntimeError(f"adapter.send failed: {_send_error(result)}")
+
+
+from gateway.startup_isolation import register
+register("recovery", "replay", "pending_tasks", "notification", "adapters")

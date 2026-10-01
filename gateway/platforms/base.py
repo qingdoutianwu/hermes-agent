@@ -1866,6 +1866,14 @@ _strip_media_directives = _strip_media_tag_directives
 class BasePlatformAdapter(ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        from gateway.startup_isolation import outbound_admission
+        for name, function in list(cls.__dict__.items()):
+            if callable(function) and (name.startswith("send") or name in {"edit_message", "delete_message", "react", "unreact"}):
+                if not getattr(function, "_startup_isolation_admission", False):
+                    setattr(cls, name, outbound_admission(function))
+
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
     # fenced terminal command; plain-text platforms get the preview).
     supports_code_blocks: bool = False
@@ -4860,3 +4868,13 @@ class BasePlatformAdapter(ABC):
         if len(chunks) > 1:
             chunks = [f"{chunk} ({i + 1}/{len(chunks)})" for i, chunk in enumerate(chunks)]
         return chunks
+
+
+from gateway.startup_isolation import register, outbound_admission
+# Fence inherited media methods too, before preprocessing or cache writes.
+# Subclass overrides are fenced by __init_subclass__; both are Core contracts.
+for _name, _function in list(BasePlatformAdapter.__dict__.items()):
+    if callable(_function) and (_name.startswith("send") or _name in {"edit_message", "delete_message", "react", "unreact"}):
+        if not getattr(_function, "_startup_isolation_admission", False):
+            setattr(BasePlatformAdapter, _name, outbound_admission(_function))
+register("external_delivery")

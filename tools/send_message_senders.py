@@ -9,6 +9,7 @@ import re
 import time
 
 from agent.redact import redact_sensitive_text
+from gateway.startup_isolation import outbound_admission
 
 logger = logging.getLogger("tools.send_message_tool")
 
@@ -82,6 +83,7 @@ def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
     return float(2 ** attempt) if any(marker in text for marker in _TELEGRAM_TRANSIENT_MARKERS) else None
 
 
+@outbound_admission
 async def _send_telegram_message_with_retry(bot, *, attempts: int = 3, **kwargs):
     """``bot.send_message`` with bounded retries on transient failures."""
     for attempt in range(attempts):
@@ -256,6 +258,7 @@ def _telegram_format(message):
         return message, ParseMode.MARKDOWN_V2, False  # formatting unavailable: send as-is
 
 
+@outbound_admission
 async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
     """One-shot Telegram Bot API send; parse failures fall back to plain text."""
     try:
@@ -442,6 +445,7 @@ async def _signal_send_batch(post, scheduler, rl, idx, n_batches, att_batch, bat
                            idx + 1, n_batches, attempt, max_attempts, str(e))
 
 
+@outbound_admission
 async def _send_signal(extra, chat_id, message, media_files=None):
     """signal-cli JSON-RPC send; attachments go in SIGNAL_MAX_ATTACHMENTS_PER_MSG batches metered
     by the process-wide SignalAttachmentScheduler (shared with the gateway adapter's rate-limit state)."""
@@ -519,6 +523,7 @@ async def _send_signal(extra, chat_id, message, media_files=None):
 
 
 # "ephemeral connect (may re-init E2EE per send, see #46310)",
+@outbound_admission
 async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, thread_id=None):
     """Matrix adapter send (native media preserved). Prefer the live gateway adapter's persistent
     olm/megolm session: ephemeral per-send connects re-init E2EE and claim one-time keys, which
@@ -582,6 +587,7 @@ def _gateway_platform_module(name, *, unavailable, unmet):
     return (module, None) if getattr(module, f"check_{name}_requirements")() else (None, {"error": unmet})
 
 
+@outbound_admission
 async def _send_weixin(pconfig, chat_id, message, media_files=None):
     """Send via Weixin iLink using the native adapter helper."""
     wx, err = _gateway_platform_module("weixin", unavailable="Weixin adapter not available.",
@@ -595,6 +601,7 @@ async def _send_weixin(pconfig, chat_id, message, media_files=None):
         return _error(f"Weixin send failed: {e}")
 
 
+@outbound_admission
 async def _send_bluebubbles(extra, chat_id, message):
     """Send via BlueBubbles iMessage server using the adapter's REST API."""
     bb, err = _gateway_platform_module("bluebubbles", unavailable="BlueBubbles adapter not available.",
@@ -617,6 +624,7 @@ async def _send_bluebubbles(extra, chat_id, message):
         return _error(f"BlueBubbles send failed: {e}")
 
 
+@outbound_admission
 async def _send_qqbot(pconfig, chat_id, message):
     """Send via the QQ Bot Open Platform REST API (no WebSocket needed)."""
     try:
@@ -658,6 +666,7 @@ async def _send_qqbot(pconfig, chat_id, message):
         return _error(f"QQBot send failed: {e}")
 
 
+@outbound_admission
 async def _send_yuanbao(chat_id, message, media_files=None):
     """Send via the running Yuanbao adapter's persistent WebSocket (no throwaway client possible)."""
     try:
