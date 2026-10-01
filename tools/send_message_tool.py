@@ -18,6 +18,7 @@ from tools.send_message_senders import (
     _registry_standalone_send, _resolve_slack_user_target, _sanitize_error_text, _send_bluebubbles,
     _send_matrix_via_adapter, _send_qqbot, _send_signal, _send_telegram, _send_weixin, _send_yuanbao)
 from tools.registry import tool_error
+from gateway.startup_isolation import outbound_admission
 
 # NOTE: ``send_message`` is intentionally NOT registered as an agent-callable model tool
 # (the agent must not fire cross-platform messages on its own); cron delivery, the
@@ -32,6 +33,8 @@ def prepare_send_message_platforms() -> None:
 
 def send_message_tool(args, **kw):
     """Handle cross-channel send_message tool calls."""
+    from gateway.startup_isolation import require
+    require("external_delivery")
     action = args.get("action", "send")
     if action == "list":
         return _handle_list()
@@ -200,6 +203,8 @@ def _handle_react(args, remove=False):
 
 
 def _handle_send(args):
+    from gateway.startup_isolation import require
+    require("external_delivery")
     target, message = args.get("target", ""), args.get("message", "")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
@@ -626,6 +631,7 @@ _PLUGIN_STANDALONE_MEDIA = {"discord": ("Discord", False, True, [], False), "fei
                             "slack": ("Slack", True, True, [], False), "whatsapp": ("WhatsApp", True, True, None, True)}
 
 
+@outbound_admission
 async def _send_plugin_standalone(platform_name, pconfig, chat_id, message, chunks, media_files, *, thread_id,
                                   max_len, force_document, mentions=None):
     """Chunked send through a plugin's standalone_sender_fn; one captionable file + short text
@@ -684,6 +690,7 @@ _TEXT_SENDERS = {
 _MEDIA_PLATFORMS_NOTE = "telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack"
 
 
+@outbound_admission
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None,
                             force_document=False, mentions=None, args=None):
     """Route to the platform sender, chunking long text with the adapters' splitter. Order matters:

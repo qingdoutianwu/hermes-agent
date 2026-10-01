@@ -3477,6 +3477,14 @@ class GatewayRunner(
         # Injected configs keep their mode (including None), except the launching profile's
         # standalone opt-out: --config must not turn that profile into a host multiplexer.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        from gateway import startup_isolation
+        startup_isolation.resolve_config()
+        if bool(getattr(self.config, "startup_isolation", False)) != startup_isolation.enabled():
+            raise startup_isolation.StartupIsolationError("startup isolation config and resolved policy disagree")
+        startup_isolation.install()
+        if startup_isolation.enabled():
+            startup_isolation.verify()
+            startup_isolation.write_receipt()
         if config is not None:
             from hermes_cli.gateway_multiplex_mode import standalone_launcher_decision, log_multiplex_decision
             decision = standalone_launcher_decision(self.config)
@@ -5691,6 +5699,9 @@ async def _start_gateway_start_control_socket(runner):
 def _start_gateway_start_cron_and_housekeeping(runner):
     """Start the cron scheduler thread + gateway housekeeping thread; returns
     ``(cron_stop, cron_provider, cron_thread, housekeeping_thread)``."""
+    from gateway import startup_isolation
+    if not startup_isolation.allowed("scheduler_dispatch"):
+        return threading.Event(), None, None, None
     # The event loop is passed so cron delivery can use live adapters (E2EE support).
     from cron.scheduler_provider import (
         InProcessCronScheduler, resolve_cron_scheduler, scheduler_for_profile_mode)
@@ -6149,6 +6160,9 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         _best_effort(_step)
     os._exit(exit_code)
 
+
+from gateway.startup_isolation import register as _register_startup_isolation
+_register_startup_isolation("scheduler_dispatch")
 
 if __name__ == "__main__":
     main()

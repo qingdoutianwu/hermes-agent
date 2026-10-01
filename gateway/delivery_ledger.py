@@ -177,6 +177,8 @@ def _db_path():
 
 
 def _connect() -> sqlite3.Connection:
+    from gateway.startup_isolation import require
+    require("delivery_state")
     from hermes_cli.sqlite_util import open_db
 
     # Shared state.db: SessionDB owns the durable PRAGMA set; this opener keeps the plain-tuple rows
@@ -554,6 +556,9 @@ def _prune_unlocked(conn, now: float) -> None:
 
 def ledger_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
     """Read the ``gateway.delivery_ledger`` config gate (default on)."""
+    from gateway.startup_isolation import allowed
+    if not allowed("pending_send"):
+        return False
     try:
         if config is None:
             from hermes_cli.config import load_config
@@ -562,3 +567,7 @@ def ledger_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
         return value.strip().lower() not in {"false", "0", "no", "off"} if isinstance(value, str) else bool(value)
     except Exception:
         return True
+
+
+from gateway.startup_isolation import register as _register_startup_isolation
+_register_startup_isolation("delivery_state", "pending_send")
