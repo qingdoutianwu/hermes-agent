@@ -17,7 +17,7 @@ def main():
     target = Path(sys.argv[1]).absolute()
     startup_isolation.resolve_config()
     # Denials are active as soon as requested, even while admission owners import.
-    if startup_isolation.enabled():
+    if startup_isolation.restricted():
         startup_isolation.write_receipt()  # effective=false until every fence registers
         startup_isolation.install()
         startup_isolation.write_receipt()

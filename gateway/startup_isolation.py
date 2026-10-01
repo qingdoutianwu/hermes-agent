@@ -1,8 +1,8 @@
 """Core-owned process-lifetime startup isolation admission policy.
 
-The only configuration authority is gateway.startup_isolation (a YAML bool).
-This policy is never injected or monkeypatched by a launcher. An enabled process
-cannot silently return to normal mode; restart with false is the normal-mode route.
+Strict gateway recovery/delivery booleans are resolved by Core before subsystem
+admission. startup_isolation retains full-safe-start precedence. A delivery fence
+cannot silently relax within the same process. No launcher injects this policy.
 """
 from __future__ import annotations
 import functools
@@ -20,6 +20,10 @@ REQUIRED = frozenset({"recovery", "replay", "pending_tasks", "pending_send",
 _requested = False
 _resolved = False
 _effective = False
+_recovery_requested = True
+_delivery_requested = True
+_state_requested = True
+_observed = {"session_recovery_count": 0, "internal_replay_count": 0}
 _registered = set()
 _denied = {}
 _lock = threading.RLock()
@@ -29,9 +33,9 @@ class StartupIsolationError(RuntimeError):
     pass
 
 
-def parse(value):
+def parse(value, name="startup_isolation"):
     if type(value) is not bool:
-        raise StartupIsolationError("gateway.startup_isolation must be an explicit boolean")
+        raise StartupIsolationError("gateway." + name + " must be an explicit boolean")
     return value
 
 
@@ -40,13 +44,22 @@ def register(*points):
         _registered.update(points)
 
 
-def resolve(value):
-    global _requested, _resolved
+def resolve(value, *, recovery_enabled=True, external_delivery_enabled=True,
+            delivery_state_write_enabled=True):
+    global _requested, _resolved, _recovery_requested, _delivery_requested, _state_requested
     requested = parse(value)
+    recovery = parse(recovery_enabled, "recovery_enabled")
+    delivery = parse(external_delivery_enabled, "external_delivery_enabled")
+    state = parse(delivery_state_write_enabled, "delivery_state_write_enabled")
+    if not requested and not delivery and state:
+        raise StartupIsolationError("Delivery OFF requires delivery_state_write_enabled=false")
     with _lock:
         if _resolved and _requested and not requested:
             raise StartupIsolationError("startup isolation cannot be disabled in a live process")
+        if _resolved and ((not _delivery_requested and delivery) or (not _state_requested and state)):
+            raise StartupIsolationError("delivery fences cannot be relaxed in a live process")
         _requested = requested
+        _recovery_requested, _delivery_requested, _state_requested = recovery, delivery, state
         _resolved = True
     return requested
 
@@ -62,17 +75,50 @@ def resolve_config():
         data = {}
     if not isinstance(data, dict) or not isinstance(data.get("gateway", {}), dict):
         raise StartupIsolationError("invalid startup isolation configuration")
-    return resolve(data.get("gateway", {}).get("startup_isolation", False))
+    cfg = data.get("gateway", {})
+    return resolve(cfg.get("startup_isolation", False),
+                   recovery_enabled=cfg.get("recovery_enabled", True),
+                   external_delivery_enabled=cfg.get("external_delivery_enabled", True),
+                   delivery_state_write_enabled=cfg.get("delivery_state_write_enabled", True))
 
 
 def enabled():
     return _requested
 
 
+def restricted():
+    return _requested or not (_recovery_requested and _delivery_requested and _state_requested)
+
+
+def delivery_fenced():
+    return _requested or not _delivery_requested
+
+
+def _permitted(action):
+    if _requested or (restricted() and not _effective):
+        return False
+    if action in {"recovery", "replay", "pending_tasks"}:
+        return _recovery_requested
+    if action in {"external_delivery", "notification", "adapters"}:
+        return _delivery_requested
+    if action == "delivery_state":
+        return _state_requested
+    if action in {"pending_send", "scheduler_dispatch"}:
+        return _delivery_requested and _state_requested
+    raise StartupIsolationError("unknown admission action: " + action)
+
+
+def observe(name, count):
+    if name not in _observed or type(count) is not int or count < 0:
+        raise StartupIsolationError("invalid recovery observation")
+    with _lock:
+        _observed[name] += count
+
+
 def allowed(action):
     if not _resolved:
         resolve_config()
-    if not _requested:
+    if _permitted(action):
         return True
     with _lock:
         _denied[action] = _denied.get(action, 0) + 1
@@ -86,7 +132,8 @@ def require(action):
 
 def verify():
     global _effective
-    if _requested:
+    if restricted():
+        _effective = False
         missing = REQUIRED - _registered
         if missing:
             raise StartupIsolationError("STARTUP_ISOLATION_FENCE_MISSING:" + ",".join(sorted(missing)))
@@ -95,7 +142,7 @@ def verify():
 
 def install():
     resolve_config()
-    if _requested:
+    if restricted():
         # Import Core admission owners, not recovery tasks, adapters or plugin transports.
         for name in ("gateway.run_startup", "gateway.delivery_ledger",
                      "gateway.platforms.base", "tools.send_message_tool", "gateway.run"):
@@ -107,13 +154,20 @@ def evidence():
     return {"schema": "hermes-core-startup-isolation.v1",
             "startup_isolation_requested": _requested,
             "startup_isolation_effective": _effective if _requested else False,
-            "session_recovery_allowed": not _requested,
-            "session_replay_allowed": not _requested,
-            "pending_task_replay_allowed": not _requested,
-            "pending_send_replay_allowed": not _requested,
-            "external_delivery_allowed": not _requested,
-            "delivery_state_write_allowed": not _requested,
-            "startup_notification_allowed": not _requested,
+            "recovery_requested": _recovery_requested,
+            "recovery_effective": _permitted("recovery"),
+            "external_delivery_requested": _delivery_requested,
+            "external_delivery_effective": _permitted("external_delivery"),
+            "session_recovery_allowed": _permitted("recovery"),
+            "session_replay_allowed": _permitted("replay"),
+            "pending_task_replay_allowed": _permitted("pending_tasks"),
+            "pending_send_replay_allowed": _permitted("pending_send"),
+            "outbound_replay_allowed": _permitted("pending_send"),
+            "external_delivery_allowed": _permitted("external_delivery"),
+            "delivery_state_write_requested": _state_requested,
+            "delivery_state_write_allowed": _permitted("delivery_state"),
+            "startup_notification_allowed": _permitted("notification"),
+            "recovery_observations": dict(_observed),
             "platform_state_write_allowed": True,
             "registered_admission_points": sorted(_registered),
             "denied_admissions": dict(_denied),

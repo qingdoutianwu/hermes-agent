@@ -97,7 +97,16 @@ class GatewayStartupMixin:
         drained = 0
         queue = getattr(self, "_startup_restore_queue", None) or []
         while queue:
-            event = queue.pop(0)
+            from gateway.startup_isolation import delivery_fenced
+            if delivery_fenced():
+                # Keep unprocessable/outbound events pending. Never drop them to obtain a safe boot.
+                event = next((item for item in queue if getattr(item, "internal", False)
+                              and self._intake_adapter_for(getattr(item, "source", None)) is not None), None)
+                if event is None:
+                    break
+                queue.remove(event)
+            else:
+                event = queue.pop(0)
             try:
                 source = getattr(event, "source", None)
                 adapter = self._intake_adapter_for(source)
@@ -118,6 +127,8 @@ class GatewayStartupMixin:
                 logger.warning("Startup-restore queued replay failed; continuing drain", exc_info=True)
                 continue
             drained += 1
+        from gateway.startup_isolation import observe
+        observe("internal_replay_count", drained)
         return drained
 
     @staticmethod
@@ -731,10 +742,13 @@ class GatewayStartupMixin:
         from gateway.run import _float_env
         resumed = ledgered = 0
         max_age = max(60 * 60, int(max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800)) * 2))
-        with _log_suppressed(logging.WARNING, "Crash-left reply recovery on startup failed: %s"):
-            ledgered = await self._ledger_crash_left_replies(max_age)
+        if allowed("delivery_state"):
+            with _log_suppressed(logging.WARNING, "Crash-left reply recovery on startup failed: %s"):
+                ledgered = await self._ledger_crash_left_replies(max_age)
         with _log_suppressed(logging.WARNING, "Exact active-turn recovery on startup failed: %s"):
             resumed = await self.async_session_store.recover_interrupted_turns(max_age_seconds=max_age)
+        from gateway.startup_isolation import observe
+        observe("session_recovery_count", resumed)
         return resumed, ledgered
 
     async def _ledger_crash_left_replies(self, max_age_seconds: int) -> int:
@@ -1606,6 +1620,19 @@ class GatewayStartupMixin:
             self._update_runtime_status("running")
             startup_isolation.write_receipt()
             logger.info("Gateway startup isolation effective; recovery, replay, adapters and background dispatch fenced")
+            return True
+        if startup_isolation.delivery_fenced():
+            # Only existing internal recovery/replay paths. No transport construction, hooks,
+            # outbound adoption, process command replay or business ticker may start here.
+            startup_isolation.verify()
+            await self._recover_unclean_sessions()
+            await self._drain_startup_restore_queue()
+            self._running = True
+            self._startup_restore_in_progress = False
+            self.delivery_router.adapters = {}
+            self._update_runtime_status("running")
+            startup_isolation.write_receipt()
+            logger.info("Gateway internal recovery enabled; external delivery and state admission fenced")
             return True
         if await self._abort_startup_if_shutdown_requested():
             return True

@@ -557,7 +557,7 @@ def _prune_unlocked(conn, now: float) -> None:
 def ledger_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
     """Read the ``gateway.delivery_ledger`` config gate (default on)."""
     from gateway.startup_isolation import allowed
-    if not allowed("pending_send"):
+    if not allowed("pending_send") or not allowed("delivery_state"):
         return False
     try:
         if config is None:

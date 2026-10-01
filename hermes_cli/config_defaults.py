@@ -2096,6 +2096,10 @@ DEFAULT_CONFIG = {
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
         # Core recovery safe-start contract. Strict boolean; process-lifetime isolation.
         "startup_isolation": False,
+        # Orthogonal Core recovery and transport/state admission. Full isolation dominates.
+        "recovery_enabled": True,
+        "external_delivery_enabled": True,
+        "delivery_state_write_enabled": True,
 
         # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
         # teardown. Keep short so service-manager shutdowns don't exhaust their stop budget.
