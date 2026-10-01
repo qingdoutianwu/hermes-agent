@@ -732,6 +732,10 @@ class GatewayNotificationsMixin:
 
         False while the update is still running (caller may retry); True after a definitive send/skip.
         """
+        from gateway.silent_startup import policy, defer
+        if policy(self) is not None:
+            defer(self, 'startup:update', 'UPDATE_COMPLETION_NOTIFICATION')
+            return False
         from gateway.run import _non_conversational_metadata
         paths = self._update_paths()
         if not paths.any_pending():
@@ -805,6 +809,9 @@ class GatewayNotificationsMixin:
 
     async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
         """Notify the chat that initiated /restart that the gateway is back."""
+        from gateway.silent_startup import defer_marker
+        if defer_marker(self, '.restart_notify.json', 'REQUESTER_RESTART_COMEBACK'):
+            return None
         from gateway.delivery import resolve_delivery_transport
         from gateway.run import _hermes_home, _non_conversational_metadata
         notify_path = _hermes_home / ".restart_notify.json"
@@ -899,6 +906,11 @@ class GatewayNotificationsMixin:
 
     async def _send_home_channel_message(self, platform, home, transport, message: str, failure_fmt: str) -> bool:
         """Best-effort send to one home channel; True on success, failures logged with ``failure_fmt``."""
+        from gateway.silent_startup import policy, defer, require_transport_admission
+        if policy(self) is not None:
+            defer(self, 'startup:home-channel', 'HOME_CHANNEL_STARTUP_MESSAGE')
+            return False
+        require_transport_admission(self)
         from gateway.run import _non_conversational_metadata
         try:
             metadata = self._thread_metadata_for_target(platform, home.chat_id, home.thread_id, adapter=transport.adapter)
@@ -950,6 +962,9 @@ class GatewayNotificationsMixin:
         one restarts first) notifies a home twice. The lock serializes a boot pass that outlived the
         restore gate against a concurrent reconnect replay.
         """
+        from gateway.silent_startup import defer_marker
+        if defer_marker(self, '.restart_pending.json', 'PLANNED_RESTART_ONLINE'):
+            return
         from gateway.run import _planned_restart_notification_path
         from utils import atomic_json_write
 
@@ -990,6 +1005,9 @@ class GatewayNotificationsMixin:
         ``skip_targets`` lets startup avoid duplicate messages when a more specific restart
         notification is queued for the same chat.
         """
+        from gateway.silent_startup import defer_marker
+        if defer_marker(self, '.restart_pending.json', 'PLANNED_RESTART_ONLINE'):
+            return set()
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
         message = t("gateway.startup.online")
@@ -1034,6 +1052,10 @@ class GatewayNotificationsMixin:
 
         See #88235.
         """
+        from gateway.silent_startup import policy, defer
+        if policy(self) is not None:
+            defer(self, 'startup:session-db-warning', 'SESSION_DB_WARNING')
+            return
         error = getattr(self, "_session_db_init_error", None)
         if not error:
             return
