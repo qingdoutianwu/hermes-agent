@@ -269,6 +269,11 @@ class GatewayStartupMixin:
         *before* ``_finish_startup_restore`` released the gate. See #91969.
         """
         from gateway.run import _startup_restore_drain_timeout_secs
+        from gateway.silent_startup import defer_marker, defer_delivery_rows
+        if defer_marker(self, '.restart_pending.json', 'PLANNED_RESTART_ONLINE'):
+            defer_marker(self, '.restart_notify.json', 'REQUESTER_RESTART_COMEBACK')
+            defer_delivery_rows(self)
+            return
         claimed = await self._claim_pending_obligations()
 
         async def _boot_sends() -> None:
@@ -323,6 +328,9 @@ class GatewayStartupMixin:
         take (#91969). Flood-refused rows adopted inside their wait come back flagged ``adopted``: their
         flags are cleared here too, and ``_redeliver_claimed_obligations`` leaves them to the timer.
         """
+        from gateway.silent_startup import defer_delivery_rows
+        if defer_delivery_rows(self):
+            return []
         try:
             from gateway.delivery_ledger import ledger_enabled, sweep_recoverable
             if not await asyncio.to_thread(ledger_enabled):
@@ -371,6 +379,9 @@ class GatewayStartupMixin:
         from gateway.delivery_ledger import flood_retry_delay, pending_retries
         target = platform if isinstance(platform, Platform) else Platform(str(platform))
         key = (target.value, profile or "default")
+        from gateway.silent_startup import defer_delivery_rows
+        if defer_delivery_rows(self):
+            return
         pending = getattr(self, "_flood_redelivery_tasks", None)
         if pending is None:
             pending = self._flood_redelivery_tasks = {}
@@ -423,6 +434,12 @@ class GatewayStartupMixin:
         """Redeliver final responses for claimed rows (network half of the split): runs inside the
         bounded boot-send task, so a flood-limited send can be abandoned by the restore gate without
         reopening the turn-replay window. Returns the redelivered count."""
+        from gateway.silent_startup import policy, defer, require_transport_admission
+        if policy(self) is not None:
+            for row in claimed:
+                defer(self, row['obligation_id'], 'PENDING_DELIVERY_REPLAY')
+            return 0
+        require_transport_admission(self)
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
         try:
@@ -505,6 +522,9 @@ class GatewayStartupMixin:
         """Replay one adapter identity's transient failures after reconnect: the startup sweep cannot
         claim live-owner rows, so ``send_path_degraded`` responses would otherwise stay failed until
         the next restart. Best-effort; reuses the startup redelivery contract."""
+        from gateway.silent_startup import defer_delivery_rows
+        if defer_delivery_rows(self):
+            return 0
         try:
             from gateway.delivery_ledger import ledger_enabled, sweep_failed_for_runtime
             if not await asyncio.to_thread(ledger_enabled):
@@ -581,6 +601,10 @@ class GatewayStartupMixin:
             _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window, _is_fresh_gateway_interruption,
         )
         window = _auto_continue_freshness_window()
+        from gateway.silent_startup import policy, defer
+        if policy(self) is not None:
+            defer(self, 'startup:resume-pending', 'INTERRUPTED_SESSION_RESUME')
+            return 0
         candidates = self._resume_pending_candidates(platform)
         if candidates is None:
             return 0
