@@ -88,6 +88,9 @@ def make_startup_runner(tmp_path):
     runner.hooks.discover_and_load = MagicMock()
     runner.hooks.emit = AsyncMock()
     runner.session_store = MagicMock()
+    # Current Core records actual integer recovery counts; a default MagicMock
+    # return is not a valid SessionStore recovery result.
+    runner.session_store.recover_interrupted_turns.return_value = 0
     runner.delivery_router = MagicMock()
     runner.delivery_router.adapters = {}
 

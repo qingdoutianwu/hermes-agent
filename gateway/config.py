@@ -586,6 +586,8 @@ _TOPLEVEL_BOOL_DEFAULTS = {
 class GatewayConfig:
     """Main gateway configuration: platform connections, session policies, delivery settings."""
     startup_isolation: bool = False
+    startup_context: str = "normal"
+    no_external_messages: bool = False
     recovery_enabled: bool = True
     external_delivery_enabled: bool = True
     delivery_state_write_enabled: bool = True
@@ -650,6 +652,7 @@ class GatewayConfig:
     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
     _SCALAR_DICT_FIELDS = (
         "startup_isolation",
+        "startup_context", "no_external_messages",
         "recovery_enabled", "external_delivery_enabled", "delivery_state_write_enabled",
         "write_sessions_json", "always_log_local", "filter_silence_narration", "stt_enabled",
         "stt_echo_transcripts", "group_sessions_per_user", "thread_sessions_per_user",
@@ -737,6 +740,11 @@ class GatewayConfig:
         policy_values = {key: parse_startup_isolation(
             data.get(key, nested_gateway.get(key, True)), key)
             for key in ("recovery_enabled", "external_delivery_enabled", "delivery_state_write_enabled")}
+        from gateway.startup_isolation import validate_context
+        context = data.get("startup_context", nested_gateway.get("startup_context", "normal"))
+        no_external = data.get("no_external_messages", nested_gateway.get("no_external_messages", False))
+        validate_context(context, no_external, policy_values["external_delivery_enabled"],
+                         policy_values["delivery_state_write_enabled"])
         if not isolation_value and not policy_values["external_delivery_enabled"] and policy_values["delivery_state_write_enabled"]:
             raise ValueError("Delivery OFF requires delivery_state_write_enabled=false")
 
@@ -818,6 +826,7 @@ class GatewayConfig:
             room_link_url=room_link_url if isinstance(room_link_url, str) else None,
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             startup_isolation=isolation_value,
+            startup_context=context, no_external_messages=no_external,
             **policy_values,
             loop_watchdog=_coerce_bool(pick("loop_watchdog"), True),
             loop_watchdog_probe_interval_s=bounded_float("loop_watchdog_probe_interval_s", DEFAULT_LOOP_WATCHDOG_INTERVAL_S, 1.0, 3600.0),

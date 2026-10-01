@@ -3482,6 +3482,9 @@ class GatewayRunner(
         if bool(getattr(self.config, "startup_isolation", False)) != startup_isolation.enabled():
             raise startup_isolation.StartupIsolationError("startup isolation config and resolved policy disagree")
         policy = startup_isolation.evidence()
+        if (getattr(self.config, "startup_context", "normal") != policy["startup_context"]
+                or getattr(self.config, "no_external_messages", False) != policy["no_external_messages"]):
+            raise startup_isolation.StartupIsolationError("resolved startup context and config disagree")
         for key in ("recovery_enabled", "external_delivery_enabled", "delivery_state_write_enabled"):
             receipt_key = {"recovery_enabled": "recovery_requested", "external_delivery_enabled": "external_delivery_requested", "delivery_state_write_enabled": "delivery_state_write_requested"}[key]
             if getattr(self.config, key, True) != policy[receipt_key]:
