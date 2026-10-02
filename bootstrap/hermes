@@ -1,0 +1,204 @@
+"""Independently sealed startup consumer; never execute from selected versions.
+
+Only stdlib is loaded before exec. Runtime policy belongs to selected Gateway,
+not this stable bootstrap. Compatible with source-only tool 4b406455 schema.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat
+import sys
+
+ENTRYPOINT = "hermes_cli/main.py"
+SELECTOR_KEYS = {"source_commit", "source_tree", "source_manifest_sha256"}
+
+
+class ConsumerError(ValueError):
+    pass
+
+
+def unique(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ConsumerError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def identity(value, length):
+    if not isinstance(value, str) or not re.fullmatch("[0-9a-f]{%d}" % length, value):
+        raise ConsumerError("immutable identity invalid")
+
+
+def authority(path, directory=False, sealed=True, mode=0o444):
+    info = path.lstat()
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected_type(info.st_mode) or info.st_uid != os.geteuid():
+        raise ConsumerError("path type/owner invalid")
+    actual = stat.S_IMODE(info.st_mode)
+    expected = 0o555 if directory else mode
+    if (sealed and actual != expected) or actual & 0o022:
+        raise ConsumerError("path authority/seal invalid")
+
+
+def git_oid(kind, data):
+    return hashlib.sha1(kind.encode() + b" " + str(len(data)).encode() + b"\0" + data).hexdigest()
+
+
+def inventory_tree(rows):
+    tree = {}
+    for row in rows:
+        node = tree
+        parts = PurePosixPath(row["path"]).parts
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                raise ConsumerError("inventory collision")
+        if parts[-1] in node:
+            raise ConsumerError("duplicate inventory path")
+        node[parts[-1]] = (row["git_mode"], row["blob_sha1"])
+    def encode(node):
+        body = b""
+        ordered = sorted(node, key=lambda name:(name + ("/" if isinstance(node[name], dict) else "")).encode())
+        for name in ordered:
+            child = node[name]
+            mode, oid = ("40000", encode(child)) if isinstance(child, dict) else child
+            body += mode.encode() + b" " + name.encode() + b"\0" + bytes.fromhex(oid)
+        return git_oid("tree", body)
+    return encode(tree)
+
+
+def resolve_once(authority_root):
+    base = Path(authority_root)
+    if not base.is_absolute() or base.resolve(strict=True) != base:
+        raise ConsumerError("canonical absolute authority required")
+    authority(base, directory=True, sealed=False)
+    versions = base / "versions"
+    authority(versions, directory=True, sealed=False)
+    selector = base / "future-source.json"
+    authority(selector)
+    raw = selector.read_bytes()  # exactly one selector read for this startup
+    selected = json.loads(raw, object_pairs_hook=unique)
+    if not isinstance(selected, dict) or set(selected) != SELECTOR_KEYS:
+        raise ConsumerError("selector schema invalid")
+    for key, size in (("source_commit",40),("source_tree",40),("source_manifest_sha256",64)):
+        identity(selected[key], size)
+    commit = selected["source_commit"]
+    mp = versions / (commit + ".manifest.json")
+    authority(mp)
+    manifest_bytes = mp.read_bytes()
+    if hashlib.sha256(manifest_bytes).hexdigest() != selected["source_manifest_sha256"]:
+        raise ConsumerError("manifest hash mismatch")
+    manifest = json.loads(manifest_bytes, object_pairs_hook=unique)
+    if not isinstance(manifest, dict) or set(manifest) != {"schema_version","source_commit","source_tree","files"}:
+        raise ConsumerError("manifest schema invalid")
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1:
+        raise ConsumerError("manifest version invalid")
+    if any(manifest[key] != selected[key] for key in ("source_commit","source_tree")):
+        raise ConsumerError("manifest identity mismatch")
+    root = versions / commit
+    authority(root, directory=True)
+    if root.resolve(strict=True) != root or not root.is_relative_to(versions):
+        raise ConsumerError("source boundary invalid")
+    if Path(__file__).resolve().is_relative_to(root):
+        raise ConsumerError("stable bootstrap must be outside selected source")
+    rows = manifest["files"]
+    if not isinstance(rows, list) or not rows:
+        raise ConsumerError("empty inventory")
+    names = set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"path","git_mode","blob_sha1","sha256","bytes"}:
+            raise ConsumerError("inventory schema invalid")
+        name = row["path"]
+        if not isinstance(name, str) or "\0" in name or "\\" in name:
+            raise ConsumerError("inventory path invalid")
+        rel = PurePosixPath(name)
+        if rel.is_absolute() or not rel.parts or ".." in rel.parts or rel.as_posix() != name or name in names:
+            raise ConsumerError("inventory path escape/duplicate")
+        names.add(name)
+        identity(row["blob_sha1"],40); identity(row["sha256"],64)
+        if type(row["bytes"]) is not int or row["bytes"] < 0:
+            raise ConsumerError("invalid size")
+        p = root / name
+        for parent in p.parents:
+            if parent == root:
+                break
+            authority(parent, directory=True)
+        mode = row["git_mode"]
+        if mode == "120000":
+            if not p.is_symlink():
+                raise ConsumerError("invalid symlink mode")
+            target = os.readlink(p)
+            if Path(target).is_absolute() or not p.resolve(strict=True).is_relative_to(root):
+                raise ConsumerError("symlink escape")
+            data = target.encode()
+        else:
+            if mode not in {"100644","100755"}:
+                raise ConsumerError("invalid Git mode")
+            authority(p, mode=0o444 if mode == "100644" else 0o555)
+            data = p.read_bytes()
+        if len(data) != row["bytes"] or hashlib.sha256(data).hexdigest() != row["sha256"] or git_oid("blob",data) != row["blob_sha1"]:
+            raise ConsumerError("source blob mismatch")
+    actual = set()
+    for p in root.rglob("*"):
+        if p.is_symlink() or p.is_file():
+            actual.add(p.relative_to(root).as_posix())
+        else:
+            authority(p,directory=True)
+    if actual != names or inventory_tree(rows) != selected["source_tree"]:
+        raise ConsumerError("source inventory/tree mismatch")
+    if ENTRYPOINT not in names or (root / ENTRYPOINT).is_symlink():
+        raise ConsumerError("entrypoint missing/nonregular")
+    return {**selected,"source_root":str(root),"selector_sha256":hashlib.sha256(raw).hexdigest(),
+            "selector_read_count":1,"consumption_mode":"STARTUP_ONLY"}
+
+
+def exec_selected(selection, arguments, runtime_python):
+    python = Path(runtime_python)
+    if not python.is_absolute() or not python.is_file() or not os.access(python, os.X_OK):
+        raise ConsumerError("approved runtime interpreter must be explicit executable path")
+    if python.resolve(strict=True) != Path(sys.executable).resolve(strict=True):
+        raise ConsumerError("runtime interpreter physical provenance differs from consumer")
+    if arguments[:2] != ["gateway", "run"] or "--external-supervisor" not in arguments:
+        raise ConsumerError("exact supervised Gateway CLI required")
+    pin = {"root": selection["source_root"]}
+    # Run the real CLI module, never a fixed old wrapper or old sealed-scheduler
+    # target. Dependencies come from the already approved interpreter generation.
+    body = (
+        "import sys,json,runpy;p=json.loads(sys.argv[1]);"
+        "sys.meta_path=[f for f in sys.meta_path if not getattr(f,'__module__','').startswith('__editable___hermes_agent')];"
+        "sys.path_hooks=[f for f in sys.path_hooks if not getattr(f,'__module__','').startswith('__editable___hermes_agent')];"
+        "sys.path=[s for s in sys.path if not s.startswith('__editable__.hermes_agent')];"
+        "sys.path_importer_cache.clear();sys.path.insert(0,p['root']);"
+        "sys.argv=[p['root']+'/hermes_cli/main.py',*sys.argv[2:]];"
+        "runpy.run_module('hermes_cli.main',run_name='__main__')"
+    )
+    os.execve(str(python), [str(python), "-I", "-B", "-c", body, json.dumps(pin), *arguments], dict(os.environ))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--authority-root", type=Path, required=True)
+    parser.add_argument("--runtime-python", type=Path, required=True)
+    parser.add_argument("arguments", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    forwarded = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
+    try:
+        selected = resolve_once(args.authority_root)
+        exec_selected(selected, forwarded, args.runtime_python)
+    except OSError as exc:
+        # OS launch failures are distinct from malformed source/CLI data.
+        code = os.EX_OSERR if exc.filename == str(args.runtime_python) else os.EX_DATAERR
+        print("STABLE_CONSUMER_FAIL_CLOSED: " + str(exc), file=sys.stderr)
+        return code
+    except (ValueError, KeyError, TypeError, RecursionError) as exc:
+        print("STABLE_CONSUMER_FAIL_CLOSED: " + str(exc), file=sys.stderr)
+        return os.EX_DATAERR
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
