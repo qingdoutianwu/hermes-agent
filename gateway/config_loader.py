@@ -94,6 +94,8 @@ _TOPLEVEL_BRIDGE: tuple = (
     *_presence("max_concurrent_sessions"),
     ("systemd_watchdog_seconds", "systemd_watchdog_seconds", "nested", None, None),
     ("startup_isolation", "startup_isolation", "nested", None, None),
+    ("startup_context", "startup_context", "nested", None, None),
+    ("no_external_messages", "no_external_messages", "nested", None, None),
     ("recovery_enabled", "recovery_enabled", "nested", None, None),
     ("external_delivery_enabled", "external_delivery_enabled", "nested", None, None),
     ("delivery_state_write_enabled", "delivery_state_write_enabled", "nested", None, None),

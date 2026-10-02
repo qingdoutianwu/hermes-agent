@@ -284,6 +284,8 @@ class GatewayStartupMixin:
         """
         from gateway.startup_isolation import allowed
         if not allowed("pending_send"):
+            from gateway.scoped_startup_defer import audit_pending
+            audit_pending()
             return
         from gateway.run import _startup_restore_drain_timeout_secs
         claimed = await self._claim_pending_obligations()
@@ -1612,6 +1614,8 @@ class GatewayStartupMixin:
         self._start_install_faulthandler()
         await self._start_log_startup_environment()
         from gateway import startup_isolation
+        from gateway.scoped_startup_defer import audit_pending
+        audit_pending()
         if startup_isolation.enabled():
             startup_isolation.verify()
             self._running = True

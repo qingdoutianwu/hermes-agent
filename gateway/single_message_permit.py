@@ -25,6 +25,12 @@ TABLE = "controlled_delivery_permits"
 class PermitDenied(RuntimeError):
     pass
 
+class TransportAdmissionDenied(PermitDenied):
+    """A valid permit is not an authorization to send in silent recovery."""
+    def __init__(self, validation=None):
+        super().__init__("SILENT_RECOVERY_TRANSPORT_DENIED")
+        self.validation = validation
+
 class DefinitelyNotSent(RuntimeError):
     """Core transport can prove no provider-side message was submitted."""
 
@@ -78,6 +84,27 @@ def _policy():
     if (not e["recovery_effective"] or e["external_delivery_effective"]
             or e["delivery_state_write_allowed"] or e["outbound_replay_allowed"]):
         raise PermitDenied("CONTROLLED_RECOVERY_ONLY_MODE_REQUIRED")
+    return e
+
+def _context_evidence(policy):
+    silent = policy.get("startup_context", "normal") == "silent_recovery"
+    no_external = policy.get("no_external_messages", False)
+    controlled_mode = (not policy["startup_isolation_requested"] and policy["recovery_effective"]
+                       and not policy["external_delivery_effective"]
+                       and not policy["delivery_state_write_allowed"]
+                       and not policy["outbound_replay_allowed"])
+    return {"execution_context": PURPOSE,
+            "startup_context": policy.get("startup_context", "normal"),
+            "silent_recovery_state": silent,
+            "external_send_allowed": controlled_mode and not (silent or no_external)}
+
+def require_transport_admission(validation=None):
+    # Does not invalidate, consume, delete or terminalize a permit. Dedicated
+    # controlled-test authority remains distinct from ordinary notification/send.
+    state = _context_evidence(_policy())
+    if not state["external_send_allowed"]:
+        raise TransportAdmissionDenied(validation)
+    return state
 
 def _path():
     from hermes_constants import get_process_hermes_home
@@ -144,32 +171,17 @@ def create_permit(message, *, ttl_seconds=60, purpose=PURPOSE):
     return evidence(permit_id)
 
 def _reserve(permit_id, message, *, ledger_entry_id, purpose, attempts):
-    _policy()
-    message.validate()
-    if type(attempts) is not int or attempts != 1:
-        raise PermitDenied("RETRY_REQUESTED")
+    validation = validate_permit(permit_id,message,ledger_entry_id=ledger_entry_id,
+                                 purpose=purpose,attempts=attempts)
+    require_transport_admission(validation)
     token = str(uuid.uuid4())
     with _transaction() as conn:
         row = conn.execute("SELECT * FROM controlled_delivery_permits WHERE permit_id=?", (permit_id,)).fetchone()
-        if row is None:
-            raise PermitDenied("PERMIT_MISSING")
-        if row["consumed"]:
-            raise PermitDenied("DENIED_ALREADY_CONSUMED")
+        # Repeat the identical validation under the durable reservation lock.
+        # The preflight is evidence, never a reusable grant across SQL races.
+        _validate_row(row,message,ledger_entry_id=ledger_entry_id,purpose=purpose,attempts=attempts)
+        require_transport_admission(validation)
         now = time.time()
-        if not row["created_at"] <= now < row["expires_at"] or row["expires_at"]-row["created_at"] > MAX_TTL:
-            raise PermitDenied("PERMIT_EXPIRED_OR_INVALID_TIME")
-        if row["purpose"] != PURPOSE or purpose != PURPOSE:
-            raise PermitDenied("PURPOSE_MISMATCH")
-        if row["channel"] != message.channel:
-            raise PermitDenied("CHANNEL_MISMATCH")
-        if row["destination_json"] != message.destination_json:
-            raise PermitDenied("DESTINATION_MISMATCH")
-        if row["canonical_text"] != message.text or row["message_sha256"] != message.message_hash:
-            raise PermitDenied("MESSAGE_HASH_MISMATCH")
-        if row["ledger_entry_id"] != ledger_entry_id:
-            raise PermitDenied("LEDGER_SCOPE_MISMATCH")
-        if row["max_transport_attempts"] != 1 or row["phase"] != "CREATED":
-            raise PermitDenied("INVALID_PERMIT_STATE")
         # Uncertain is persisted BEFORE side effect. Crash at any subsequent point is
         # terminal/non-retryable without requiring restart-time row surgery.
         conn.execute("""UPDATE controlled_delivery_permits SET consumed=1,
@@ -178,7 +190,49 @@ def _reserve(permit_id, message, *, ledger_entry_id, purpose, attempts):
             (token,now,permit_id))
     return token
 
+def _validate_row(row, message, *, ledger_entry_id, purpose, attempts):
+    message.validate()
+    if type(attempts) is not int or attempts != 1:
+        raise PermitDenied("RETRY_REQUESTED")
+    if row is None:
+        raise PermitDenied("PERMIT_MISSING")
+    if row["consumed"]:
+        raise PermitDenied("DENIED_ALREADY_CONSUMED")
+    now = time.time()
+    if not row["created_at"] <= now < row["expires_at"] or row["expires_at"]-row["created_at"] > MAX_TTL:
+        raise PermitDenied("PERMIT_EXPIRED_OR_INVALID_TIME")
+    if row["purpose"] != PURPOSE or purpose != PURPOSE:
+        raise PermitDenied("PURPOSE_MISMATCH")
+    if row["channel"] != message.channel:
+        raise PermitDenied("CHANNEL_MISMATCH")
+    if row["destination_json"] != message.destination_json:
+        raise PermitDenied("DESTINATION_MISMATCH")
+    if row["canonical_text"] != message.text or row["message_sha256"] != message.message_hash:
+        raise PermitDenied("MESSAGE_HASH_MISMATCH")
+    if row["ledger_entry_id"] != ledger_entry_id:
+        raise PermitDenied("LEDGER_SCOPE_MISMATCH")
+    if row["max_transport_attempts"] != 1 or row["phase"] != "CREATED":
+        raise PermitDenied("INVALID_PERMIT_STATE")
+
+def validate_permit(permit_id, message, *, ledger_entry_id, purpose=PURPOSE, attempts=1):
+    """Read-only exact permit validation; does NOT imply transport admission."""
+    policy = _policy()
+    path = _path()
+    if not path.exists():
+        raise PermitDenied("PERMIT_MISSING")
+    with sqlite3.connect(path.as_uri()+"?mode=ro",uri=True,timeout=10) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(TABLE,)).fetchone():
+            raise PermitDenied("PERMIT_MISSING")
+        row = conn.execute("SELECT * FROM controlled_delivery_permits WHERE permit_id=?",(permit_id,)).fetchone()
+        _validate_row(row,message,ledger_entry_id=ledger_entry_id,purpose=purpose,attempts=attempts)
+    return {"permit_validation":"PASS","permit_id":permit_id,
+            "message_sha256":message.message_hash,"ledger_entry_id":ledger_entry_id,
+            **_context_evidence(policy)}
+
 def _transport_entry(permit_id, token):
+    require_transport_admission()
     with _transaction() as conn:
         changed = conn.execute("""UPDATE controlled_delivery_permits
             SET phase='TRANSPORT_INVOKED',transport_entry_count=1,updated_at=?
@@ -230,7 +284,10 @@ def evidence(permit_id):
         if row is None:
             raise PermitDenied("PERMIT_MISSING")
         r = dict(row)
+    from gateway import startup_isolation as policy
+    policy.resolve_config()
     return {"schema":"hermes-core-single-message-permit.v1","permit_id":r["permit_id"],
+        **_context_evidence(policy.evidence()),
         "purpose":r["purpose"],"channel":r["channel"],
         "destination_identity_hash":hashlib.sha256(r["destination_json"].encode()).hexdigest(),
         "message_sha256":r["message_sha256"],"max_transport_attempts":r["max_transport_attempts"],

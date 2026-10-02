@@ -23,6 +23,8 @@ _effective = False
 _recovery_requested = True
 _delivery_requested = True
 _state_requested = True
+_startup_context = "normal"
+_no_external_messages = False
 _observed = {"session_recovery_count": 0, "internal_replay_count": 0}
 _registered = set()
 _denied = {}
@@ -44,22 +46,38 @@ def register(*points):
         _registered.update(points)
 
 
+def validate_context(context, no_external_messages, delivery, state):
+    if not isinstance(context, str) or context not in {"normal", "silent_recovery"}:
+        raise StartupIsolationError("invalid gateway.startup_context")
+    parse(no_external_messages, "no_external_messages")
+    if context == "silent_recovery" and (not no_external_messages or delivery or state):
+        raise StartupIsolationError("silent_recovery requires NO_EXTERNAL_MESSAGES and delivery/state OFF")
+    if context == "normal" and no_external_messages:
+        raise StartupIsolationError("NO_EXTERNAL_MESSAGES requires explicit silent_recovery context")
+    return context
+
+
 def resolve(value, *, recovery_enabled=True, external_delivery_enabled=True,
-            delivery_state_write_enabled=True):
+            delivery_state_write_enabled=True, startup_context="normal", no_external_messages=False):
     global _requested, _resolved, _recovery_requested, _delivery_requested, _state_requested
+    global _startup_context, _no_external_messages
     requested = parse(value)
     recovery = parse(recovery_enabled, "recovery_enabled")
     delivery = parse(external_delivery_enabled, "external_delivery_enabled")
     state = parse(delivery_state_write_enabled, "delivery_state_write_enabled")
+    context = validate_context(startup_context, no_external_messages, delivery, state)
     if not requested and not delivery and state:
         raise StartupIsolationError("Delivery OFF requires delivery_state_write_enabled=false")
     with _lock:
+        if _resolved and _startup_context == "silent_recovery" and context != _startup_context:
+            raise StartupIsolationError("silent recovery cannot relax within a live process")
         if _resolved and _requested and not requested:
             raise StartupIsolationError("startup isolation cannot be disabled in a live process")
         if _resolved and ((not _delivery_requested and delivery) or (not _state_requested and state)):
             raise StartupIsolationError("delivery fences cannot be relaxed in a live process")
         _requested = requested
         _recovery_requested, _delivery_requested, _state_requested = recovery, delivery, state
+        _startup_context, _no_external_messages = context, no_external_messages
         _resolved = True
     return requested
 
@@ -79,7 +97,9 @@ def resolve_config():
     return resolve(cfg.get("startup_isolation", False),
                    recovery_enabled=cfg.get("recovery_enabled", True),
                    external_delivery_enabled=cfg.get("external_delivery_enabled", True),
-                   delivery_state_write_enabled=cfg.get("delivery_state_write_enabled", True))
+                   delivery_state_write_enabled=cfg.get("delivery_state_write_enabled", True),
+                   startup_context=cfg.get("startup_context", "normal"),
+                   no_external_messages=cfg.get("no_external_messages", False))
 
 
 def enabled():
@@ -152,6 +172,8 @@ def install():
 
 def evidence():
     return {"schema": "hermes-core-startup-isolation.v1",
+            "startup_context": _startup_context,
+            "no_external_messages": _no_external_messages,
             "startup_isolation_requested": _requested,
             "startup_isolation_effective": _effective if _requested else False,
             "recovery_requested": _recovery_requested,

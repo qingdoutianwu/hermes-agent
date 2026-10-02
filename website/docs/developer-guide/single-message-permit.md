@@ -5,6 +5,28 @@ explicit controlled-test path, not an ordinary sender, notification, or pending
 replay exception. It is usable only in verified Recovery ON / Global Delivery OFF
 / Delivery state writes OFF mode. Full startup isolation always denies it.
 
+Permit validity and transport admission are separate. `validate_permit(...)` reads
+the exact permit row using SQLite read-only/query-only mode, validating destination,
+message, purpose, TTL, one-attempt budget and ledger scope without consuming it.
+It reports `permit_validation=PASS`, `execution_context`, `startup_context`,
+`silent_recovery_state` and `external_send_allowed`. Validity alone never grants send.
+
+Under explicit `gateway.startup_context: silent_recovery` and
+`gateway.no_external_messages: true`, a valid request remains valid, but reservation
+and transport admission reject with `TransportAdmissionDenied`. No provider call,
+attempt count, consumption or unrelated obligation mutation occurs on that denial.
+The exception carries the successful validation evidence when available. A request
+with genuinely invalid scope, content or expiry still fails permit validation.
+Normal context preserves the existing recovery-only controlled one-shot capability;
+this does not globally enable or disable ordinary messaging.
+
+The dedicated Core Telegram provider entry checks the same admission before invoking
+the client. Calling it directly does not bypass silent context. An already durable
+reservation remains consumed/uncertain if context becomes silent before transport;
+it is not cancelled, rolled back, refreshed or retried. Existing post-transport
+receipt/uncertainty handling is unchanged. Context fields are runtime evidence,
+not a new SQL table schema or a second permit authority.
+
 A permit binds UUID identity/nonce, purpose CONTROLLED_DELIVERY_TEST, one channel,
 exact canonical destination (profile, account, effective chat ID and thread),
 visible UTF-8 message bytes and SHA256, finite TTL (maximum 300s), attempts=1,

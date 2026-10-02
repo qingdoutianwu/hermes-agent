@@ -5,7 +5,7 @@ The owning Core route resolver must supply a client verified against the permit'
 profile/account identity; accepting untrusted clients is not a routing contract.
 """
 from dataclasses import dataclass
-from gateway.single_message_permit import ExactMessage, PermitDenied
+from gateway.single_message_permit import ExactMessage, PermitDenied, require_transport_admission
 
 @dataclass(frozen=True)
 class ControlledTelegramTransport:
@@ -18,6 +18,9 @@ class ControlledTelegramTransport:
         message.validate()
         if message.channel != self.channel or message.destination_json != self.destination_json:
             raise PermitDenied("TRANSPORT_ROUTE_MISMATCH")
+        # A permit's validity or a trusted direct call cannot override silent
+        # runtime context. This precedes any provider invocation.
+        require_transport_admission()
         destination=json.loads(self.destination_json)
         thread=destination["thread_id"]
         if thread is not None and (not thread.isdecimal() or int(thread) <= 1):

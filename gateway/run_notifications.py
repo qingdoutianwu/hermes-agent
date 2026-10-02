@@ -732,6 +732,11 @@ class GatewayNotificationsMixin:
 
         False while the update is still running (caller may retry); True after a definitive send/skip.
         """
+        from gateway.startup_isolation import allowed
+        if not allowed("notification"):
+            from gateway.scoped_startup_defer import audit_pending
+            audit_pending()
+            return False
         from gateway.run import _non_conversational_metadata
         paths = self._update_paths()
         if not paths.any_pending():
@@ -805,6 +810,11 @@ class GatewayNotificationsMixin:
 
     async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
         """Notify the chat that initiated /restart that the gateway is back."""
+        from gateway.startup_isolation import allowed
+        if not allowed("notification"):
+            from gateway.scoped_startup_defer import audit_pending
+            audit_pending()
+            return None
         from gateway.delivery import resolve_delivery_transport
         from gateway.run import _hermes_home, _non_conversational_metadata
         notify_path = _hermes_home / ".restart_notify.json"
@@ -950,6 +960,11 @@ class GatewayNotificationsMixin:
         one restarts first) notifies a home twice. The lock serializes a boot pass that outlived the
         restore gate against a concurrent reconnect replay.
         """
+        from gateway.startup_isolation import allowed
+        if not allowed("notification"):
+            from gateway.scoped_startup_defer import audit_pending
+            audit_pending()
+            return
         from gateway.run import _planned_restart_notification_path
         from utils import atomic_json_write
 
