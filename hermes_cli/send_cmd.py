@@ -234,6 +234,8 @@ def cmd_send(args: argparse.Namespace) -> None:
     # Routes to the platform adapter (bot-token path for built-ins, live-adapter path for plugin
     # platforms); takes the standard tool-call dict and returns a JSON string.
     tool_args = {"action": "send", "target": target, "message": message}
+    if getattr(args, "strict_topic", False):
+        tool_args["strict_topic"] = True
     if mentions:
         tool_args["mentions"] = mentions
     result = send_message_tool(tool_args)
@@ -242,6 +244,9 @@ def cmd_send(args: argparse.Namespace) -> None:
 
 # (flags, add_argument kwargs) in --help order.
 _SEND_ARGUMENTS = (
+    (("--strict-topic",), dict(action="store_true", default=False, help=(
+        "Telegram text only: require explicit numeric chat/topic, native delivery admission, "
+        "no topic fallback and response route evidence. Fails closed if admission is unavailable."))),
     (("-t", "--to"), dict(metavar="TARGET", default=None, help=(
         "Delivery target. Format: 'platform' (home channel), "
         "'platform:chat_id', 'platform:chat_id:thread_id', or "

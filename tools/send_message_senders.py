@@ -165,11 +165,17 @@ async def _telegram_send_media(bot, chat_id, f, ext, is_voice, force_document, *
     return await getattr(bot, f"send_{kind}")(chat_id=chat_id, **{kind: f}, **kwargs)
 
 
-async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, text_kwargs):
+async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, text_kwargs, *, strict_topic=False):
     """One text chunk with adapter-matching fallbacks: thread-not-found -> retry without
     ``message_thread_id`` (dropped from ``text_kwargs`` for later chunks too); parse failure
     -> plain text."""
     async def send(text, mode):
+        if strict_topic:
+            from tools.send_message_telegram_strict import delivery_admission_error
+            denied = delivery_admission_error()
+            if denied:
+                raise RuntimeError(denied)
+            return await _send_telegram_message_with_retry(bot, attempts=1, chat_id=chat_id, text=text, parse_mode=mode, **text_kwargs)
         return await _send_telegram_message_with_retry(bot, chat_id=chat_id, text=text, parse_mode=mode, **text_kwargs)
     try:
         return await send(chunk, parse_mode)
@@ -177,6 +183,8 @@ async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, t
         # Thread not found — retry without message_thread_id so the message still delivers (matching the
         # gateway adapter's fallback behaviour, issue #27012).
         if _is_telegram_thread_not_found(md_error) and text_kwargs.get("message_thread_id") is not None:
+            if strict_topic:
+                raise  # Never drop the requested topic in strict mode.
             logger.warning("Thread %s not found in _send_telegram, retrying without message_thread_id",
                            text_kwargs.pop("message_thread_id"))
             return await send(chunk, parse_mode)
@@ -256,8 +264,11 @@ def _telegram_format(message):
         return message, ParseMode.MARKDOWN_V2, False  # formatting unavailable: send as-is
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, strict_topic=False):
     """One-shot Telegram Bot API send; parse failures fall back to plain text."""
+    if strict_topic:
+        from tools.send_message_telegram_strict import send_strict_topic
+        return await send_strict_topic(token, chat_id, message, thread_id, media_files)
     try:
         formatted, send_parse_mode, _has_html = _telegram_format(message)
         bot = _telegram_bot(token)

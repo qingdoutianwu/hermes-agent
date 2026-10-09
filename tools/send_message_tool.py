@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from functools import partial
 
 from agent.secret_scope import get_secret
@@ -205,6 +206,18 @@ def _handle_send(args):
     target, message = args.get("target", ""), args.get("message", "")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
+    strict_topic = args.get("strict_topic") is True
+    if strict_topic:
+        # No home-channel/default resolution or credential load before this gate.
+        parts = target.split(":")
+        if (len(parts) != 3 or parts[0] != "telegram"
+                or not re.fullmatch(r"-?\d+", parts[1])
+                or not parts[2].isdigit() or int(parts[2]) <= 1):
+            return tool_error("STRICT_TELEGRAM_EXPLICIT_CHAT_TOPIC_REQUIRED")
+        from tools.send_message_telegram_strict import delivery_admission_error
+        denied = delivery_admission_error()
+        if denied:
+            return tool_error(denied)
     # Lone surrogates reach the outbound body via surrogateescape-decoded argv
     # (`hermes send` MESSAGE) and crash the UTF-8 marshal inside platform SDK
     # request bodies (feishu/lark, #113799). Every send_message caller (model tool
@@ -269,6 +282,12 @@ def _handle_send(args):
         # Only custom plugin handlers receive the complete typed request. ``mentions`` is a WhatsApp-only
         # contract (the CLI rejects it elsewhere); other platforms' standalone senders don't accept the kwarg.
         handler_args = {"args": args} if entry is not None and entry.send_message_handler is not None else {}
+        if strict_topic:
+            # Strict contract belongs to the verified native text sender, not
+            # an arbitrary plugin handler or media fallback.
+            if handler_args or media_files or media_dropped:
+                return tool_error("STRICT_TELEGRAM_TEXT_ONLY")
+            handler_args["strict_topic"] = True
         mentions = args.get("mentions")
         if mentions and platform_name == "whatsapp":
             handler_args["mentions"] = [mentions] if isinstance(mentions, str) else list(mentions)
@@ -687,7 +706,7 @@ _MEDIA_PLATFORMS_NOTE = "telegram, discord, matrix, weixin, signal, yuanbao, fei
 
 
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None,
-                            force_document=False, mentions=None, args=None):
+                            force_document=False, mentions=None, args=None, strict_topic=False):
     """Route to the platform sender, chunking long text with the adapters' splitter. Order matters:
     Weixin first (its native helper must not be blocked by unrelated optional imports such as
     lark-oapi), Telegram (chunks itself), plugin standalone media, native chunked, generic text."""
@@ -698,6 +717,10 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
     # Telegram chunks internally on the *formatted* text (escaping inflates length).
     if platform == Platform.TELEGRAM:
+        if strict_topic:
+            return await _send_telegram(
+                pconfig.token, chat_id, message, media_files=media_files,
+                thread_id=thread_id, strict_topic=True)
         return await _send_telegram(
             pconfig.token, chat_id, message, media_files=media_files, thread_id=thread_id, force_document=force_document,
             disable_link_previews=bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")))
