@@ -2,6 +2,9 @@
 import argparse
 import asyncio
 import json
+import contextlib
+import io
+import subprocess
 import sys
 import types
 import unittest
@@ -10,6 +13,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter
 from hermes_cli.send_cmd import cmd_send, register_send_subparser
+from hermes_cli.send_cmd import _emit_result
 from tools import send_message_senders as native
 from tools import send_message_tool as tool_module
 
@@ -23,6 +27,7 @@ class StrictTelegramContractTests(unittest.TestCase):
         self.addCleanup(module_patch.stop)
         self.factory = Mock(return_value=object())
         self.call = AsyncMock()
+        self.native_request_helper = native._send_telegram_message_with_retry
         self.splitter = Mock(side_effect=lambda text,*a,**kw:[text])
         overrides = {
             "_telegram_format":lambda s:(s,None,False), "_telegram_bot":self.factory,
@@ -138,13 +143,95 @@ class StrictTelegramContractTests(unittest.TestCase):
         self.assertFalse(r["external_attempted"])
         self.factory.assert_not_called()
 
-    def test_strict_format_fallback_keeps_topic(self):
+    def test_strict_format_error_does_not_resend(self):
         self.call.side_effect=[ValueError("can't parse markdown"),self.response()]
         r=self.send()
-        self.assertTrue(r["confirmed"])
-        self.assertEqual(self.call.await_count,2)
+        self.assertFalse(r["confirmed"])
+        self.assertEqual(r["status"], "unknown")
+        self.assertTrue(r["external_attempted"])
+        self.assertFalse(r["safe_to_auto_retry"])
+        self.assertEqual(self.call.await_count,1)
         self.assertTrue(all(c.kwargs["message_thread_id"]==7 for c in self.call.call_args_list))
         self.assertTrue(all(c.kwargs["attempts"]==1 for c in self.call.call_args_list))
+
+    def _assert_ambiguous_once(self, error):
+        # A hypothetical later success must never conceal the first UNKNOWN.
+        self.call.side_effect=[error,self.response()]
+        result=self.send()
+        self.assertEqual(self.call.await_count,1)
+        self.assertEqual(result["status"],"unknown")
+        self.assertFalse(result["success"])
+        self.assertFalse(result["confirmed"])
+        self.assertTrue(result["external_attempted"])
+        self.assertFalse(result["safe_to_auto_retry"])
+
+    def test_r2_exact_html_timeout_reproduction(self):
+        self._assert_ambiguous_once(TimeoutError("timeout retrieving HTML response"))
+
+    def test_subprocess_timeout_html_never_retries(self):
+        self._assert_ambiguous_once(subprocess.TimeoutExpired(["synthetic"], 1, output="<HTML>"))
+
+    def test_native_timedout_html_never_retries(self):
+        from telegram.error import TimedOut
+        self._assert_ambiguous_once(TimedOut("HTML format parsing timed out"))
+
+    def test_connection_reset_after_request_never_retries(self):
+        self._assert_ambiguous_once(ConnectionResetError("HTML connection reset after request"))
+
+    def test_uncertain_html_response_never_retries(self):
+        self._assert_ambiguous_once(RuntimeError("HTML response: result unsupported or unknown"))
+
+    def test_format_and_network_timeout_never_retries(self):
+        self._assert_ambiguous_once(TimeoutError("parse markdown format network timeout"))
+
+    def test_unknown_transport_exception_never_retries(self):
+        self._assert_ambiguous_once(RuntimeError("unsupported format; transport state unknown"))
+
+    def test_nth_chunk_timeout_stops_following_chunks(self):
+        self.splitter.side_effect=lambda *a,**kw:["first","second","third"]
+        self.call.side_effect=[self.response(mid=9),TimeoutError("HTML timeout"),self.response(mid=11)]
+        result=self.send()
+        self.assertEqual(self.call.await_count,2)
+        self.assertEqual(result["status"],"unknown")
+        self.assertFalse(result["confirmed"])
+        self.assertFalse(result["safe_to_auto_retry"])
+        self.assertTrue(result["external_attempted"])
+        self.assertEqual([r["message_id"] for r in result["receipts"]],[9])
+
+    def test_real_request_helper_does_not_retry_ambiguous_send(self):
+        from tools.send_message_telegram_strict import send_strict_topic
+        request_bot=types.SimpleNamespace(send_message=AsyncMock(
+            side_effect=[TimeoutError("HTML timeout"),self.response()]))
+        # Restore the actual helper; mock only the final native Bot request.
+        with patch.object(native,"_telegram_bot",return_value=request_bot), \
+             patch.object(native,"_send_telegram_message_with_retry",self.native_request_helper):
+            result=asyncio.run(send_strict_topic("synthetic","-10042","synthetic",7))
+        self.assertEqual(request_bot.send_message.await_count,1)
+        self.assertEqual(result["status"],"unknown")
+
+    def test_legacy_format_fallback_remains_unchanged(self):
+        self.call.side_effect=[ValueError("can't parse markdown"),self.response()]
+        kwargs={"message_thread_id":7}
+        result=asyncio.run(native._telegram_send_text_chunk(
+            object(),-10042,"synthetic","MarkdownV2",False,kwargs))
+        self.assertEqual(result.message_id,9)
+        self.assertEqual(self.call.await_count,2)
+        self.assertEqual(self.call.call_args.kwargs["message_thread_id"],7)
+
+    def test_unknown_cli_json_keeps_status_and_failure_exit(self):
+        self.call.side_effect=[TimeoutError("HTML timeout"),self.response()]
+        result=self.send()
+        stream=io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            exit_code=_emit_result(json.dumps(result),json_mode=True,quiet=False)
+        emitted=json.loads(stream.getvalue())
+        self.assertEqual(exit_code,1)
+        self.assertEqual(emitted["status"],"unknown")
+        self.assertFalse(emitted["success"])
+        self.assertFalse(emitted["confirmed"])
+        self.assertTrue(emitted["external_attempted"])
+        self.assertFalse(emitted["safe_to_auto_retry"])
+        self.assertEqual(self.call.await_count,1)
 
     def test_fence_revoked_between_chunks_blocks_future_action(self):
         self.splitter.side_effect=lambda *a,**kw:["first","second"]

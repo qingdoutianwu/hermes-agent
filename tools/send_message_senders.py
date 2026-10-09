@@ -180,11 +180,13 @@ async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, t
     try:
         return await send(chunk, parse_mode)
     except Exception as md_error:
+        if strict_topic:
+            # The transport may already have sent. Exception text cannot
+            # prove a pre-send rejection, so strict mode never re-sends.
+            raise
         # Thread not found — retry without message_thread_id so the message still delivers (matching the
         # gateway adapter's fallback behaviour, issue #27012).
         if _is_telegram_thread_not_found(md_error) and text_kwargs.get("message_thread_id") is not None:
-            if strict_topic:
-                raise  # Never drop the requested topic in strict mode.
             logger.warning("Thread %s not found in _send_telegram, retrying without message_thread_id",
                            text_kwargs.pop("message_thread_id"))
             return await send(chunk, parse_mode)

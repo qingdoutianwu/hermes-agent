@@ -8,8 +8,10 @@ The option is forwarded to the existing native sender through its tool boundary.
 The native formatter, text splitter, Bot factory and request helper are reused.
 Strict mode rejects media, home/default targets, topic mapping changes and empty
 text before external requests. Thread-not-found cannot drop the requested topic;
-each native request uses one attempt. Definitive formatting rejection may retry
-plain text in the same Topic only, with admission rechecked before that request.
+each native request uses one attempt. Strict mode never performs format fallback
+after an exception: exception wording cannot prove a pre-send rejection, and
+timeout/reset/HTML/parse errors may occur after successful external delivery.
+Every such post-attempt outcome stays UNKNOWN without another request.
 Legacy mode keeps its existing compatibility behavior.
 
 Every chunk needs a message ID, actual response chat ID and actual response
@@ -26,9 +28,9 @@ permit, signer, flag override or Recovery transition is supplied by this patch.
 Mock admission success is conditional source proof, not real authorization.
 Existing relay destination authorization remains in place.
 
-21 strict behavioral tests use real module imports and mock only request,
+32 strict behavioral tests use real module imports and mock only request,
 admission and inactive Gateway runtime seams. The broader 4-file targeted suite
-has 147 tests. No native lifecycle or real network is initialized. Canonical
+has 158 tests. No native lifecycle or real network is initialized. Canonical
 `scripts/run_tests.sh` is run in a disposable source copy with isolated HOME,
 offline guard and no-running-Gateway mock (the baseline's unrelated live-Gateway
 import is incompatible with the managed Python 3.11 typing runtime).
