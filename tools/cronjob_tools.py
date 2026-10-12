@@ -241,6 +241,10 @@ def _claim_for_manual_run(job_id: str, log_label: str):
     """At-most-once claim shared by the sync and background run paths: ``(claimed_job, None)`` or
     ``(None, error_dict)`` in the ``_execute_job_now`` shape. A lost claim is labelled precisely —
     claim_job_for_fire also returns False for paused/disabled/missing jobs, not just in-flight ones."""
+    from gateway.startup_isolation import allowed
+    if not allowed("scheduler_dispatch"):
+        return None, {"claimed": False, "success": False,
+                      "error": "STARTUP_ISOLATION_DENIED:scheduler_dispatch"}
     try:
         claimed_job = claim_job_for_fire(job_id, manual=True, return_job=True)
         if isinstance(claimed_job, dict):

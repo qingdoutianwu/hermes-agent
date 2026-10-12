@@ -86,6 +86,9 @@ class GatewayStartupMixin:
     ) -> None:
         """Dispatch one synthetic startup resume and wait for its agent turn (inbound stays queued
         until it finishes, else a user message can race it)."""
+        from gateway.startup_isolation import allowed
+        if not allowed("replay") or not allowed("pending_send"):
+            return
         from gateway.run import _AGENT_PENDING_SENTINEL
         try:
             await adapter.handle_message(event)
@@ -114,6 +117,9 @@ class GatewayStartupMixin:
 
     async def _drain_startup_restore_queue(self) -> int:
         """Replay inbound messages queued while startup auto-resume ran."""
+        from gateway.startup_isolation import allowed
+        if not allowed("replay") or not allowed("pending_send"):
+            return 0
         drained = 0
         queue = getattr(self, "_startup_restore_queue", None) or []
         while queue:
@@ -291,6 +297,9 @@ class GatewayStartupMixin:
         ``_send_restart_notification`` and ``_redeliver_pending_obligations`` used to be awaited inline
         *before* ``_finish_startup_restore`` released the gate. See #91969.
         """
+        from gateway.startup_isolation import allowed
+        if not allowed("pending_send"):
+            return
         from gateway.run import _startup_restore_drain_timeout_secs
         claimed = await self._claim_pending_obligations()
 
@@ -346,6 +355,9 @@ class GatewayStartupMixin:
         take (#91969). Flood-refused rows adopted inside their wait come back flagged ``adopted``: their
         flags are cleared here too, and ``_redeliver_claimed_obligations`` leaves them to the timer.
         """
+        from gateway.startup_isolation import allowed
+        if not allowed("pending_send") or not allowed("delivery_state"):
+            return []
         try:
             from gateway.delivery_ledger import ledger_enabled, sweep_recoverable
             if not await asyncio.to_thread(ledger_enabled):
@@ -446,6 +458,9 @@ class GatewayStartupMixin:
         """Redeliver final responses for claimed rows (network half of the split): runs inside the
         bounded boot-send task, so a flood-limited send can be abandoned by the restore gate without
         reopening the turn-replay window. Returns the redelivered count."""
+        from gateway.startup_isolation import allowed
+        if not allowed("pending_send") or not allowed("delivery_state"):
+            return 0
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
         try:
@@ -600,6 +615,9 @@ class GatewayStartupMixin:
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
         sessions with a running agent are skipped so none is resumed twice."""
+        from gateway.startup_isolation import allowed
+        if not allowed("recovery") or not allowed("pending_send"):
+            return 0
         from gateway.run import (
             _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window, _is_fresh_gateway_interruption,
         )
@@ -739,11 +757,15 @@ class GatewayStartupMixin:
         finished its turn (the marker is held until the reply is ledgered), so nothing re-runs it —
         the old 120 s recency sweep re-answered every recently active chat. Returns (resumed,
         ledgered)."""
+        from gateway.startup_isolation import allowed
+        if not allowed("recovery"):
+            return 0, 0
         from gateway.run import _float_env
         resumed = ledgered = 0
         max_age = max(60 * 60, int(max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800)) * 2))
-        with _log_suppressed(logging.WARNING, "Crash-left reply recovery on startup failed: %s"):
-            ledgered = await self._ledger_crash_left_replies(max_age)
+        if allowed("delivery_state"):
+            with _log_suppressed(logging.WARNING, "Crash-left reply recovery on startup failed: %s"):
+                ledgered = await self._ledger_crash_left_replies(max_age)
         with _log_suppressed(logging.WARNING, "Exact active-turn recovery on startup failed: %s"):
             resumed = await self.async_session_store.recover_interrupted_turns(max_age_seconds=max_age)
         return resumed, ledgered
@@ -1186,6 +1208,9 @@ class GatewayStartupMixin:
     async def _start_prefilter_platforms(self) -> tuple[bool, int, list, list]:
         """Create + wire an adapter per enabled platform (no connects). Returns
         (aborted, enabled_platform_count, multiplex_skipped_platforms, pending_connects)."""
+        from gateway.startup_isolation import allowed
+        if not allowed("adapters"):
+            return False, 0, [], []
         from gateway.run import _platform_has_bot_credential
         from gateway.run_adapters import _adapter_unavailable_message
         enabled_platform_count = 0
@@ -1474,6 +1499,9 @@ class GatewayStartupMixin:
 
     async def _start_post_connect_services(self, connected_count: int) -> None:
         """Room worker, heartbeat, gateway:startup hook, channel directory, /update notice."""
+        from gateway.startup_isolation import allowed
+        if not allowed("pending_tasks") or not allowed("notification"):
+            return
         from gateway.run import _hermes_home
         try:
             await self._ensure_hosted_room_worker()
@@ -1877,3 +1905,7 @@ class GatewayStartupMixin:
             raise RuntimeError(f"adapter.send failed: {exc}") from exc
         if not getattr(result, "success", True):
             raise RuntimeError(f"adapter.send failed: {_send_error(result)}")
+
+
+from gateway.startup_isolation import register as _register_startup_isolation
+_register_startup_isolation("recovery", "replay", "pending_tasks", "adapters")

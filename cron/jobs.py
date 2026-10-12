@@ -2751,7 +2751,14 @@ def claim_job_for_fire(
     ``claim_ttl_seconds`` exists (the TTL lets another fire reclaim after a crash; mark_job_run
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
     ``next_run_at`` so a stale re-delivery cannot re-fire."""
+    from gateway.startup_isolation import allowed
+    # Refuse before taking a claim/advancing an occurrence or force-resuming a Job.
+    if not allowed("scheduler_dispatch"):
+        return False
+
     def apply(jobs, _i, job):
+        if not allowed("scheduler_dispatch"):
+            return False
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
         # Both enabled and pause markers must clear — a half-paused record must not claim. ``force``
@@ -3506,3 +3513,7 @@ def rewrite_skill_refs(
             save_jobs(jobs)
             logger.info("Curator rewrote skill references in %d cron job(s)", len(rewrites))
         return {"rewrites": rewrites, "jobs_updated": len(rewrites), "jobs_scanned": len(jobs)}
+
+
+from gateway.startup_isolation import register as _register_startup_isolation
+_register_startup_isolation("scheduler_dispatch")

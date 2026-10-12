@@ -5752,6 +5752,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
     systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop
     deadlocks); ``force`` starts without consulting the host owner at all."""
+    from gateway import startup_isolation
+    # The existing Core policy must verify registration before any subsystem starts.
+    startup_isolation.install()
     # Set here (not at import) so incidental gateway.run imports from CLI code don't poison it.
     os.environ["HERMES_EXEC_ASK"] = "1"
 

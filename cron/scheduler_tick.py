@@ -80,6 +80,9 @@ def _tick_admitted(
     # Stale-code yield gate — BEFORE the lock race. A process whose checkout was updated under it
     # serves mixed sys.modules (jobs die on ImportErrors); if a fresher gateway holds the runtime
     # lock, ITS ticker dispatches. With no fresh holder (desktop-standalone) the tick proceeds.
+    from gateway.startup_isolation import allowed
+    if not allowed("scheduler_dispatch"):
+        return 0
     _skew = _sched._should_yield_tick_to_fresh_gateway()
     if _skew is not None:
         _log_tick_yield_once(f"boot={_skew[0]} disk={_skew[1]}")
