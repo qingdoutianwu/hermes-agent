@@ -287,12 +287,8 @@ def _release_flock(lock_fd) -> None:
 
 @contextlib.contextmanager
 def _jobs_lock(*, strict=False):
-    """Serialize a load_jobs→modify→save_jobs critical section: in-process RLock (parallel tick
-    threads) plus a cross-process flock on ``<cron dir>/.jobs.lock`` (gateway vs. CLI writes —
-    otherwise a `cron pause` could be clobbered and keep firing). Nested calls in one thread
-    reuse the held lock. Without a flock backend, or on flock timeout (logged loudly), it
-    degrades to in-process-only locking: a briefly torn cross-process write beats a dead
-    scheduler."""
+    """Thread/process store serialization. Legacy timeout degrades; strict admission refuses.
+    Nested strict use may inherit only a verified cross-process lock."""
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
         if strict and not getattr(_jobs_lock_state, "strict", False):
@@ -306,10 +302,7 @@ def _jobs_lock(*, strict=False):
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
-        # jobs.json stamp as of this section's load_jobs(): lets _save_jobs_unlocked skip the
-        # shrink-merge parse when the file provably hasn't changed. Reset on entry/exit so stale
-        # stamps from unlocked loads or prior sections can never suppress a needed merge.
-        # See #80703.
+        # Reset stamps so nested/stale loads cannot suppress the shrink-merge guard (#80703).
         _jobs_lock_state.load_stamp = None
         lock_fd = None
         try:
@@ -550,7 +543,9 @@ def _has_pause_marker(job: dict[str, Any]) -> bool:
 def is_job_runnable(job: dict[str, Any]) -> bool:
     """True iff the scheduler may fire this job: ``enabled`` plus pause markers as a second gate so
     a contradictory half-paused record never fires even before self-heal runs."""
-    return bool(job.get("enabled", True)) and not _has_pause_marker(job)
+    from cron.future_admission import confirmed
+    return (bool(job.get("enabled", True)) and not _has_pause_marker(job)
+            and (not job.get("dispatch_generation") or confirmed(job)))
 
 
 def effective_job_state(job: dict[str, Any]) -> str:
@@ -2673,9 +2668,7 @@ def clear_run_claim(job_id: str) -> bool:
 
 
 def advance_next_runs(job_ids, *, expected_generations=None) -> int:
-    """Batch form of :func:`advance_next_run`: one load + at most one save for the whole due set;
-    one-shot/unknown ids are skipped. Returns the count advanced. Persisted once at the end, so a
-    crash mid-batch re-fires the whole set on restart rather than a prefix (sub-10ms window)."""
+    """Batch recurring advance, at most one save; stale captured generations are skipped."""
     ids = set(job_ids)
     if not ids:
         return 0
@@ -2687,6 +2680,8 @@ def advance_next_runs(job_ids, *, expected_generations=None) -> int:
             if (
                 job["id"] not in ids
                 or job.get("dispatch_generation", 0) != (expected_generations or {}).get(job["id"], 0)
+                or (job.get("dispatch_generation") and not is_job_runnable(job))
+                or (job.get("dispatch_generation") and job.get("manual_run_at") == job.get("next_run_at"))
                 or (is_terminal_job(job) and not _is_recoverable_error_job(job))
                 or job.get("schedule", {}).get("kind") not in {"cron", "interval"}
             ):
@@ -2725,23 +2720,22 @@ def _machine_id() -> str:
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False,
     manual: bool = False, return_job: bool = False, expected_generation: Optional[int] = None,
+    expected_instant: Optional[str] = None,
 ) -> bool | dict[str, Any]:
-    """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
-    caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
-    fence + file lock: reject missing/terminal/paused jobs unless ``force`` (explicit manual
-    fire, which also resumes the job atomically; external callbacks must leave it false so a
-    stale callback cannot resurrect a paused job). ``manual`` = off-tick run-now without the
-    resume: no occurrence stamp, so the still-pending ``next_run_at`` slot is not skipped. Lose if a claim younger than
-    ``claim_ttl_seconds`` exists (the TTL lets another fire reclaim after a crash; mark_job_run
-    clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
-    ``next_run_at`` so a stale re-delivery cannot re-fire."""
+    """Fire-fenced CAS. Missing/terminal/paused jobs refuse unless explicit force.
+
+    Manual attempts remain occurrence-free; live claims exclude duplicates.
+    Protected scheduled attempts require captured generation + exact instant.
+    Force cannot bypass an unconfirmed future-resume publication.
+    """
     def apply(jobs, _i, job):
-        if job.get("dispatch_generation", 0) != (expected_generation or 0):
+        from cron.future_admission import valid_fire
+        if not valid_fire(job, expected_generation, manual=manual or force or
+                          bool(job.get("manual_run_at") == job.get("next_run_at")), instant=expected_instant):
             return False
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
-        # Both enabled and pause markers must clear — a half-paused record must not claim. ``force``
-        # (Trigger-now on a paused job) bypasses the gate and atomically resumes the job below.
+        # Explicit force clears pause markers, never the durable admission fence.
         if not force and not is_job_runnable(job):
             return False
         now = _hermes_now()
@@ -2754,6 +2748,10 @@ def claim_job_for_fire(
         # stamping it would make completed_occurrence() skip that slot when it arrives.
         manual_fire = force or manual or job.get("manual_run_at") == job.get("next_run_at")
         instant = None if manual_fire else scheduled_instant(job.get("next_run_at"))
+        if job.get("dispatch_generation") and not manual_fire:
+            instant = scheduled_instant(expected_instant)
+            if instant is None or datetime.fromisoformat(instant) > now:
+                return False
         # A scheduled tick only ever fires when now >= next_run_at
         # (_evaluate_due_job returns False while the stored occurrence is still
         # in the future), so a claim arriving BEFORE the stored next occurrence
@@ -2781,14 +2779,14 @@ def claim_job_for_fire(
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
         # previous runner must not heartbeat the new claim merely because hostname + PID match.
         job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
-        # Claimed: the occurrence is now owned by a run (its ledger row + fire claim carry it).
         job.pop("pending_slot", None)
-        if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
+        if job.get("schedule", {}).get("kind") in {"cron", "interval"} and not (job.get("dispatch_generation") and manual_fire):
             nxt = compute_next_run(job["schedule"], now.isoformat())
             if nxt:
                 job["next_run_at"] = nxt
         save_jobs(jobs)
-        return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
+        return dict(copy.deepcopy(job), _scheduled_instant=instant,
+                    _dispatch_kind="manual" if manual_fire else "scheduled") if return_job else True
 
     return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
 
@@ -3333,6 +3331,8 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
                 continue
             if _has_pause_marker(job):
                 _self_disable_half_paused(job, scan)
+                continue
+            if job.get("dispatch_generation") and not is_job_runnable(job):
                 continue
             if _evaluate_due_job(job, scan, run_claim_ttl):
                 due.append(job)

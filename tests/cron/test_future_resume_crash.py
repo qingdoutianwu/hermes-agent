@@ -37,6 +37,16 @@ elif phase == 'after_replace':
         original_replace(*args)
         os._exit(73)
     jobs.atomic_replace = replace
+elif phase == 'before_ledger_commit':
+    import cron.future_admission as admission
+    original_confirm = admission.confirm_after_replace
+    def confirm(*args):
+        original_confirm(*args)
+        os._exit(74)
+    admission.confirm_after_replace = confirm
+elif phase == 'after_ledger_commit':
+    import cron.future_resume as future_resume
+    future_resume._result = lambda *args, **kwargs: os._exit(75)
 with jobs.use_cron_store(home):
     result = resume_future_only(jid, expected_revision=revision, request_id='crash-request')
 print(json.dumps(result))
@@ -68,7 +78,8 @@ def test_abrupt_exit_store_is_all_or_nothing(paused_store, phase, code, committe
     assert (current["state"] == "scheduled") is committed
     if committed:
         retried = resume_future_only(jid, expected_revision=revision, request_id="crash-request")
-        assert retried["replayed"] and current["dispatch_generation"] == 1
+        assert retried["error"] == "BLOCKED_RESUME_UNCONFIRMED" and current["dispatch_generation"] == 1
+        assert jobs.is_job_runnable(current) is False
     else:
         assert current["state"] == "paused"
     assert jobs.get_due_jobs() == []
@@ -85,3 +96,17 @@ def test_success_and_same_request_survive_fresh_interpreter(paused_store):
     assert first_result["operation"] == second_result["operation"]
     assert second_result["replayed"]
     assert jobs.get_due_jobs() == []
+
+
+@pytest.mark.parametrize("phase,code,admitted", [
+    ("before_ledger_commit", 74, False), ("after_ledger_commit", 75, True),
+])
+def test_admission_commit_crash_boundary(paused_store, phase, code, admitted):
+    jid, _, _, home = paused_store
+    revision = inspect_job_revision(jid)["revision"]
+    outcome = child(home, jid, revision, phase)
+    assert outcome.returncode == code, outcome.stderr
+    assert jobs.is_job_runnable(raw(jid)) is admitted
+    retried = resume_future_only(jid, expected_revision=revision, request_id="crash-request")
+    assert retried["success"] is admitted
+    assert raw(jid)["dispatch_generation"] == 1

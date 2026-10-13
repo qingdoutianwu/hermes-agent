@@ -2523,6 +2523,10 @@ class _FireAudit:
 
 
 
+from cron.future_dispatch import fence_business
+
+
+@fence_business
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
@@ -2532,13 +2536,6 @@ def run_job(
     MUST call ``_teardown_cron_agent(agent)`` AFTER delivery (a torn-down async client can't
     deliver). ``extra_prompt``: per-fire context, never persisted.
 
-    ``defer_agent_teardown``: when a caller passes a list, ``run_job`` skips the agent's async-resource
-    teardown (``agent.close()`` + ``cleanup_stale_async_clients()``) in its ``finally`` block and instead
-    appends the live agent to that list. The caller is then responsible for calling
-    ``_teardown_cron_agent(agent)`` AFTER it has delivered the result. This closes the ordering window in
-    #58720 where delivery ran against a torn-down async client (defense-in-depth alongside the
-    interpreter-shutdown guard). When ``None`` (the default) teardown happens inline as before, so every
-    existing caller is unchanged.
     ``extra_prompt``: optional per-run context from ``cronjob(action='run', prompt=...)`` (#57331). Appended
     to the stored prompt for this fire only — never persisted to the job definition.
     """
@@ -4238,7 +4235,8 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
     # Claim on worker start, using the captured dispatch generation.
     try:
-        claim_args = {"expected_generation": job["dispatch_generation"]} if job.get("dispatch_generation") else {}
+        claim_args = {"expected_generation": job["dispatch_generation"],
+                      "expected_instant": job.get("_scheduled_instant")} if job.get("dispatch_generation") else {}
         claimed = claim_job_for_fire(job["id"], return_job=True, **claim_args)
     except OSError as exc:
         store_health.note_unwritable(exc, f"skipped job '{job.get('name') or job['id']}'", "claim", [job])
@@ -4256,6 +4254,9 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    if claimed_job.get("dispatch_generation"):
+        from cron.future_admission import record_execution_admission
+        record_execution_admission(job["execution_id"], claimed_job)
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
@@ -4296,11 +4297,7 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     def _not_dispatched_shutdown() -> None:
         logger.warning("Job '%s' not dispatched — interpreter is shutting down", job_label)
 
-    # During interpreter shutdown pool.submit raises; skip — the job fires on the next tick.
-    # If the interpreter is finalizing (gateway SIGTERM / restart / OOM), scheduling any new delivery is
-    # futile — asyncio.run and a fresh ThreadPoolExecutor both raise "cannot schedule new futures after
-    # interpreter shutdown". Skip gracefully with a warning rather than emitting an ERROR traceback on every
-    # restart-race (#58720, #55924).
+    # Interpreter shutdown refuses dispatch; leave the slot for the next healthy tick.
     # A tick can race gateway teardown: once the interpreter is finalizing, ``pool.submit`` raises "cannot
     # schedule new futures after interpreter shutdown" and crashes the tick. Skip cleanly — the job stays
     # due and will fire on the next healthy tick (#58720, #55924).
@@ -4321,6 +4318,9 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         execution = create_execution(
             job_id, source="builtin", scheduled_instant=job.get("_scheduled_instant"))
         dispatched_job = dict(job, execution_id=execution["id"])
+        if job.get("dispatch_generation"):
+            from cron.future_admission import record_execution_admission
+            record_execution_admission(execution["id"], job)
         note_cron_execution(dispatched_job)
         _ctx = contextvars.copy_context()
     except Exception as execution_err:

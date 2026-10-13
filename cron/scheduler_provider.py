@@ -197,7 +197,8 @@ class CronScheduler(ABC):
             return False
         return self.fire_claimed(claimed_job, adapters=adapters, loop=loop)
 
-    def claim_fire(self, job_id: str, *, force: bool = False, manual: bool = False) -> dict | None:
+    def claim_fire(self, job_id: str, *, force: bool = False, manual: bool = False,
+                   expected_generation: int | None = None, scheduled_instant: str | None = None) -> dict | None:
         """Durably claim one fire + create its audit attempt. Transports call this synchronously
         before acknowledging, then pass the exact snapshot to ``fire_claimed`` off-thread."""
         from cron.executions import create_execution, finish_execution, set_execution_occurrence
@@ -209,10 +210,15 @@ class CronScheduler(ABC):
             claim_kwargs["force"] = True
         if manual:
             claim_kwargs["manual"] = True
+        if expected_generation is not None:
+            claim_kwargs.update(expected_generation=expected_generation, expected_instant=scheduled_instant)
         try:
             claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
             if isinstance(claimed_job, dict):
                 set_execution_occurrence(execution["id"], claimed_job.get("_scheduled_instant"))
+                if claimed_job.get("dispatch_generation"):
+                    from cron.future_admission import record_execution_admission
+                    record_execution_admission(execution["id"], claimed_job)
         except BaseException as exc:
             finish_execution(
                 execution["id"], success=False,

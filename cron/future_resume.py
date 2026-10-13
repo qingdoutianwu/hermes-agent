@@ -103,7 +103,7 @@ def _prepare(job, expected_revision, request_id, checked_at):
     instant = datetime.fromisoformat(selected).astimezone(UTC) if selected else None
     if instant is None or instant <= checked_at:
         raise ResumeBlocked("BLOCKED_NO_FUTURE_SLOT")
-    operation = {"request_id": request_id, "expected_revision": expected_revision,
+    operation = {"protocol": "post_replace_v2", "request_id": request_id, "expected_revision": expected_revision,
                  "boundary": checked_at.isoformat(), "next_run_at": selected,
                  "generation": generation + 1}
     job.update(enabled=True, state="scheduled", paused_at=None, paused_reason=None,
@@ -125,6 +125,10 @@ def _resume_locked(job_id, expected_revision, request_id):
         if prior.get("expected_revision") != expected_revision:
             raise ResumeBlocked("BLOCKED_REQUEST_ID_CONFLICT")
         # Return the original outcome, not a claim about the job's present lifecycle.
+        from cron.future_admission import confirmed
+        if not confirmed(job):
+            return {"success": False, "error": "BLOCKED_RESUME_UNCONFIRMED", "atomic_persisted": True,
+                    "dispatch_admitted": False, "operation": prior}
         return _result(prior, replayed=True)
     checked_at = jobs._hermes_now().astimezone(UTC)
     checked_mono = time.monotonic()
@@ -135,6 +139,12 @@ def _resume_locked(job_id, expected_revision, request_id):
         validate = lambda: _validate_time(checked_at, checked_mono, next_run)
         validate()
         jobs._save_jobs_unlocked(records, before_commit=validate)
+        from cron.future_admission import confirm_after_replace
+        try:
+            confirm_after_replace(job, conn, checked_at, checked_mono, next_run)
+        except ResumeBlocked as exc:
+            return {"success": False, "error": str(exc), "atomic_persisted": True,
+                    "dispatch_admitted": False, "operation": operation}
     return _result(operation)
 
 

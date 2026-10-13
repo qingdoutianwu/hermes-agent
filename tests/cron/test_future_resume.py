@@ -141,7 +141,8 @@ def test_post_commit_error_same_request_recovers(paused_store, monkeypatch):
     first = resume_future_only(jid, expected_revision=rev, request_id="durable")
     assert first["error"] == "PERSISTENCE_OUTCOME_UNKNOWN"
     second = resume_future_only(jid, expected_revision=rev, request_id="durable")
-    assert second["success"] and second["replayed"]
+    assert second["success"] is False and second["error"] == "BLOCKED_RESUME_UNCONFIRMED"
+    assert jobs.is_job_runnable(raw(jid)) is False
     assert raw(jid)["dispatch_generation"] == 1
 
 

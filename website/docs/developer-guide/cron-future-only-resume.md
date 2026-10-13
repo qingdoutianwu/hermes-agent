@@ -1,6 +1,9 @@
-# Future-only Cron resume — R1 partial candidate
+# Future-only Cron resume — R1 history and R2 partial candidate
 
 **Status: CANDIDATE_PARTIAL_BLOCKED. Not installed, deployed, or approved upstream.**
+R1 remains immutable at `e886f8235cc6bd9f30a0902383821d0715e1168f`.
+The sections below describing R1 gaps are historical evidence; see the R2
+contract at the end for the implemented changes and remaining limitations.
 This is a source candidate based on installed Hermes 0.21.7 commit
 `3b63f7b0a4c7beb9eadbce2f15b9da75d01f5065`, not a claim about latest upstream main.
 Do not use the candidate to authorize an existing production Job's recovery.
@@ -141,3 +144,73 @@ scan/admission; original IDs and unrelated Jobs remain unchanged. It cannot
 revoke already admitted workers or retract Telegram/iMessage effects. No
 production rollback was attempted and there is no production-ready rollback
 claim while the forward recovery contract remains partial.
+
+## R2: post-replace durable admission fence
+
+The lifecycle commit point is the existing atomic replacement of `jobs.json`.
+The candidate does not first resume and then rewrite `next_run_at`. Its single
+JSON transition includes a `post_replace_v2` operation/generation. Until a
+matching confirmation commits in the **existing profile execution ledger**, the
+Job is non-runnable, even if its display fields say enabled/scheduled.
+
+The confirmation's clock sample occurs after the JSON replace and directory
+fsync return. It must precede the chosen slot, with the existing lead/clock
+continuity checks. Thus a slot that expires during JSON persistence gets no
+confirmation. Indefinite stalls retain the fire/store locks; process exit
+releases locks but rolls back the SQLite transaction and leaves dispatch
+blocked. No new database, daemon, global ESTOP or Scheduler is introduced.
+
+SQLite confirmation commit is the admission publication point. The confirmation
+sample is an upper bound on the earlier JSON commit, not a claim that filesystem
+rename and wall clock are one primitive. A delay after the confirmation sample
+can allow normal late execution of a slot which was genuinely future at the
+JSON commit; this is not recovery of a pre-commit expired slot. Missing ledger
+records never auto-confirm on restart/retry; identical requests read back either
+the confirmed original outcome or `BLOCKED_RESUME_UNCONFIRMED`. JSON fields can
+remain scheduled but non-runnable after failure. This is explicitly a safe
+incomplete publication, not a claim of a two-database atomic transaction or
+automatic rollback to paused.
+
+Due scan, recurring advance, snapshot admission, fire claim and business
+entry now enforce confirmation. `force` cannot override missing confirmation.
+Native execution rows additionally bind generation and fire owner. Protected
+raw `run_job` requires a running, matching native attempt before script/agent
+preparation. Generation remains concurrency metadata, not provenance.
+
+Explicit native `manual=True`/`force=True` claims remain occurrence-free and
+preserve the pending scheduled slot. The native `trigger_job` marker survives
+protected batch advance. Provider `claim_fire` accepts additive
+`expected_generation` and `scheduled_instant`; a protected scheduled callback
+without them is refused, not silently upgraded to a current scheduled event.
+Provider manual claims carry native fire ownership plus execution binding.
+The existing transport/tool authorization boundaries are unchanged; these
+parameters do not grant business permission.
+
+R1's two diagnostic scenarios were reproduced on the unmodified implementation,
+then converted to safety assertions (both failed on R1). R2 closes those scoped
+scenarios. New tests cover provider old/current/manual claims, long persistence
+with simultaneous scan/manual claim, native trigger, unresolved confirmation,
+profile-local confirmation and protected direct business refusal. Process exit
+tests additionally cover before and after ledger confirmation commit.
+
+### R2 remaining blockers — do not promote
+
+- Raw **unprotected** legacy `run_job` retains its old locking contract, to
+  avoid holding the fire fence across legacy registration/sweep interactions.
+  Its race with the first protection transition is not certified. The native
+  registered paths are guarded, but arbitrary raw/private entry paths cannot
+  be declared covered by those tests.
+- Third-party provider overrides, mixed-version/degraded legacy writers and
+  the full protected detached-worker adoption/delivery failure matrix remain
+  unverified. Unknown entry paths must not be used for protected execution.
+- The complete Cron regression has baseline failures (incident/preflight and
+  a managed-interpreter child codec failure); exact results live in R2 closeout.
+  No test was removed or marked passed merely because it failed on R1 too.
+- Production shared-file attribution remains separate. B4-R2 preserves the
+  target record and whole-store hash, not all other Job preimages. A changed
+  SHA alone cannot prove business configuration drift or its authorization.
+
+Both scoped diagnostic fixes are not equivalent to all-execution-path acceptance.
+Upstream/integration readiness stays false until these proof boundaries and
+regression failures are resolved. R3 baseline, Production Job and messages are
+untouched; no automatic deployment or recovery follows this candidate.
