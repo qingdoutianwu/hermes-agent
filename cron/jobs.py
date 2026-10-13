@@ -286,7 +286,7 @@ def _release_flock(lock_fd) -> None:
 
 
 @contextlib.contextmanager
-def _jobs_lock():
+def _jobs_lock(*, strict=False):
     """Serialize a load_jobs→modify→save_jobs critical section: in-process RLock (parallel tick
     threads) plus a cross-process flock on ``<cron dir>/.jobs.lock`` (gateway vs. CLI writes —
     otherwise a `cron pause` could be clobbered and keep firing). Nested calls in one thread
@@ -295,6 +295,8 @@ def _jobs_lock():
     scheduler."""
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
+        if strict and not getattr(_jobs_lock_state, "strict", False):
+            raise OSError("Strict cron transaction cannot inherit a degraded lock")
         _jobs_lock_state.depth = depth + 1
         try:
             yield
@@ -315,7 +317,13 @@ def _jobs_lock():
                 ensure_dirs()
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8-sig")
                 lock_fd.seek(0)
-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
+                acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
+                if strict and acquired is not True:
+                    lock_fd.close()
+                    lock_fd = None
+                    raise OSError("Strict cron store lock unavailable")
+                _jobs_lock_state.strict = acquired is True
+                if acquired is False:
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
@@ -326,6 +334,11 @@ def _jobs_lock():
                         lock_fd.close()
                     lock_fd = None
             except OSError as e:
+                if strict:
+                    if lock_fd is not None:
+                        lock_fd.close()
+                        lock_fd = None
+                    raise
                 # A locking failure must never take down cron writes — in-process lock still held.
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
                                "proceeding with in-process lock only", e)
@@ -337,6 +350,7 @@ def _jobs_lock():
         finally:
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
+            _jobs_lock_state.strict = False
 
 
 @contextlib.contextmanager
@@ -1553,7 +1567,7 @@ _SAVE_JOBS_MERGE_ATTEMPTS = 5
 
 def _save_jobs_unlocked(
     jobs: list[dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
-    replace: bool = False,
+    replace: bool = False, before_commit=None,
 ):
     """Save all jobs; caller must hold _jobs_lock(). ``removed_ids`` = intentional deletes;
     ``replace=True`` skips the shrink-merge guard and the corrupt-store refusal (wholesale
@@ -1584,6 +1598,8 @@ def _save_jobs_unlocked(
                 tmp_path = None
                 continue
             # fsync the directory the rename actually landed in (atomic_replace resolves symlinks).
+            if before_commit is not None:
+                before_commit()
             replaced = Path(atomic_replace(tmp_path, jobs_file))
             tmp_path = None
             fsync_directory(replaced.parent)
@@ -2164,43 +2180,15 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[dict[str, A
 
 
 def resume_job(job_id: str) -> Optional[dict[str, Any]]:
-    """Resume a paused job. Accepts a job ID or name.
+    """Ordinary resume retains elapsed slots; see jobs_resume.resume_job."""
+    from cron.jobs_resume import resume_job as legacy_resume
+    return legacy_resume(job_id)
 
-    A recurring job paused across one of its slots must not lose that slot silently: the stored
-    ``next_run_at`` (already past) survives resume as the due instant, and the ordinary late /
-    catch-up / ``cron.catch_up_missed`` policy in the due scan decides what happens to it — one
-    fire or a logged skip, never a silent re-anchor past it (#113603). One-shots and future
-    instants recompute from now as before.
-    """
-    job = resolve_job_ref(job_id)
-    if not job:
-        return None
-    stored_next = job.get("next_run_at")
-    stored_dt = _parse_aware(stored_next) if stored_next else None
-    if (
-        job["schedule"].get("kind") in {"cron", "interval"}
-        and stored_dt is not None
-        and _instant_at_or_before(stored_dt, _hermes_now())
-    ):
-        next_run_at = stored_next
-        logger.info(
-            "Job '%s' resumed with occurrence %s that elapsed while paused kept due; the next "
-            "tick fires it (late/catch-up) or logs the skip.",
-            job.get("name", job["id"]), stored_next)
-    else:
-        next_run_at = compute_next_run(job["schedule"])
-    if next_run_at is None and job["schedule"].get("kind") == "once":
-        run_at = job["schedule"].get("run_at", "unknown")
-        raise ValueError(
-            f"Cannot resume: one-shot time {run_at} is in the past "
-            f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire.")
-    return update_job(job["id"], {
-        "enabled": True,
-        "state": "scheduled",
-        "paused_at": None,
-        "paused_reason": None,
-        "next_run_at": next_run_at,
-    })
+
+def resume_future_only(job_id: str, **kwargs) -> dict:
+    """Explicit CAS future-only candidate; does not change ordinary resume."""
+    from cron.future_resume import resume_future_only as future_resume
+    return future_resume(job_id, **kwargs)
 
 
 def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[dict[str, Any]]:
@@ -2684,7 +2672,7 @@ def clear_run_claim(job_id: str) -> bool:
     return _with_job(job_id, apply, False)
 
 
-def advance_next_runs(job_ids) -> int:
+def advance_next_runs(job_ids, *, expected_generations=None) -> int:
     """Batch form of :func:`advance_next_run`: one load + at most one save for the whole due set;
     one-shot/unknown ids are skipped. Returns the count advanced. Persisted once at the end, so a
     crash mid-batch re-fires the whole set on restart rather than a prefix (sub-10ms window)."""
@@ -2698,6 +2686,7 @@ def advance_next_runs(job_ids) -> int:
         for job in jobs:
             if (
                 job["id"] not in ids
+                or job.get("dispatch_generation", 0) != (expected_generations or {}).get(job["id"], 0)
                 or (is_terminal_job(job) and not _is_recoverable_error_job(job))
                 or job.get("schedule", {}).get("kind") not in {"cron", "interval"}
             ):
@@ -2735,7 +2724,7 @@ def _machine_id() -> str:
 
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False,
-    manual: bool = False, return_job: bool = False,
+    manual: bool = False, return_job: bool = False, expected_generation: Optional[int] = None,
 ) -> bool | dict[str, Any]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
@@ -2747,6 +2736,8 @@ def claim_job_for_fire(
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
     ``next_run_at`` so a stale re-delivery cannot re-fire."""
     def apply(jobs, _i, job):
+        if job.get("dispatch_generation", 0) != (expected_generation or 0):
+            return False
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
         # Both enabled and pause markers must clear — a half-paused record must not claim. ``force``

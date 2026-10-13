@@ -62,7 +62,9 @@ def _advance_or_drop_recurring(_sched, due_jobs: list) -> list:
     (no durable advance -> a crash mid-run would re-fire them, so skipping is the at-most-once
     side). One-shots still go through their own fire claim."""
     try:
-        _sched.advance_next_runs([job["id"] for job in due_jobs])
+        generations = {j["id"]: j.get("dispatch_generation", 0) for j in due_jobs}
+        args = {"expected_generations": generations} if any(generations.values()) else {}
+        _sched.advance_next_runs([job["id"] for job in due_jobs], **args)
         return due_jobs
     except OSError as exc:
         skipped = [j for j in due_jobs if is_recurring(j)]

@@ -1388,3 +1388,14 @@ Cron jobs run in a completely fresh agent session. The prompt must contain every
 ## Security
 
 Scheduled task prompts are scanned for prompt-injection and credential-exfiltration patterns at creation and update time. Prompts containing invisible Unicode tricks, SSH backdoor attempts, or obvious secret-exfiltration payloads are blocked.
+
+## Future-only recovery candidate
+
+An experimental, **not deployment-approved** `hermes cron revision JOB_ID` /
+`hermes cron resume-future-only JOB_ID --expected-revision REV --request-id ID`
+surface is available in the safe-resume source candidate. Ordinary `resume`
+retains its catch-up behavior. The new candidate refuses unresolved executions
+and preserves the original schedule and delivery configuration, but its full
+commit/dispatch boundary and provider/manual compatibility are still blocked.
+Do not use it to restore production jobs. See the
+[developer contract](../../developer-guide/cron-future-only-resume.md).

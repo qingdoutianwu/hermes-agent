@@ -2778,13 +2778,9 @@ def run_one_job(
     claim (callers use the store CAS) but keeps it alive. True if processed (a job failure is
     recorded via ``mark_job_run``), False only if processing raised. ``cancel_event``: optional
     transport-level cancel (dashboard drain)."""
-    # Every gateway path (built-in scheduler, external providers, and direct
-    # API fires) crosses this seam.  Ensure the detached worker has a durable
-    # attempt to adopt before any launch can occur.
-    if not job.get("execution_id"):
-        execution = create_execution(
-            job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))
-        job["execution_id"] = execution["id"]
+    from cron.future_dispatch import prepare_direct_execution
+    if not prepare_direct_execution(sys.modules[__name__], job):
+        return False
 
     execution_id = str(job["execution_id"])
     note_cron_execution(job)
@@ -4240,9 +4236,10 @@ def _sweep_mcp_orphans() -> None:
 
 def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
-    # Claim only when the worker actually starts, so a queued lease can't expire first.
+    # Claim on worker start, using the captured dispatch generation.
     try:
-        claimed = claim_job_for_fire(job["id"], return_job=True)
+        claim_args = {"expected_generation": job["dispatch_generation"]} if job.get("dispatch_generation") else {}
+        claimed = claim_job_for_fire(job["id"], return_job=True, **claim_args)
     except OSError as exc:
         store_health.note_unwritable(exc, f"skipped job '{job.get('name') or job['id']}'", "claim", [job])
         settle_unstarted_execution(
@@ -4256,13 +4253,16 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
         finish_execution(
             job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
         return True
-    # CAS returns the persisted record; bool fallback only for older test doubles.
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
+from cron.future_dispatch import fence_submission
+
+
+@fence_submission
 def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, process_job):
     """Submit with the in-flight dedup guard; None if a prior tick's run is still in flight.
     Running-set membership is released in the worker's finally."""
@@ -4316,7 +4316,6 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     # ``ctx.run``, where the per-profile cron scope is not bound, so releasing without it would
     # discard the LAUNCH home's key and leak every secondary profile's claim.
     _claim_home = _get_hermes_home()
-    # Record the attempt before dispatch; recovery marks abandoned rows unknown (no retry).
     execution = None
     try:
         execution = create_execution(

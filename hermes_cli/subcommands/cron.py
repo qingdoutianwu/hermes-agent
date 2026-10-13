@@ -161,6 +161,13 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_resume.add_argument("--at", dest="run_at", help="Re-arm at an ISO-8601 time")
     _flag(cron_resume, "--run-now", help="Re-arm to run now")
 
+    revision = cron_subparsers.add_parser("revision", help="Read exact stored Job revision (no repair)")
+    revision.add_argument("job_id", help="Exact Job ID, not a name")
+    future = cron_subparsers.add_parser("resume-future-only", help="CAS resume without historical catch-up (candidate)")
+    future.add_argument("job_id", help="Exact paused Job ID")
+    future.add_argument("--expected-revision", required=True, help="Revision returned by cron revision")
+    future.add_argument("--request-id", required=True, help="Unique caller operation ID; reuse ONLY for the same request")
+
     cron_run = cron_subparsers.add_parser("run", help="Run a job on the next scheduler tick")
     cron_run.add_argument("job_id", help="Job ID to trigger")
     add_accept_hooks_flag(cron_run)

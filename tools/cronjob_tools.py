@@ -1014,12 +1014,18 @@ def cronjob(
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: Optional[bool] = None,
-    interpreter: Optional[str] = None) -> str:
+    interpreter: Optional[str] = None,
+    expected_revision: Optional[str] = None,
+    request_id: Optional[str] = None) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
     try:
         normalized = (action or "").strip().lower()
+        if normalized in {"revision", "resume_future_only"}:
+            from tools.cronjob_future_resume import action as future_action
+            a["action"] = normalized
+            return future_action(a)
         handler = _JOBLESS_ACTIONS.get(normalized)
         if handler is not None:
             return handler(a)
@@ -1067,12 +1073,14 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, update, pause, resume, remove, run, revision, resume_future_only. Future-only is an opt-in candidate: exact ID, paused+disabled, expected_revision and request_id required; never triggers a run. Ordinary resume retains catch-up semantics."
             },
             "job_id": {
                 "type": "string",
                 "description": "Required for update/pause/resume/remove/run."
             },
+            "expected_revision": {"type": "string", "description": "resume_future_only only: exact revision from action=revision."},
+            "request_id": {"type": "string", "description": "resume_future_only only: unique operation ID. On uncertain outcome inspect/reuse identical ID and revision, do not mint a retry ID."},
             "pinned": {
                 "type": "boolean",
                 "description": "For create/update. ONLY set when the user explicitly asks to pin (or unpin) a job's model. pinned=true locks the CURRENT main agent model (and its provider) onto the job so later `hermes model` / `/model` changes never touch it; pinned=false releases the lock so the job follows the main agent model again. Never set it on your own initiative: by default jobs follow the main model."
@@ -1170,7 +1178,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned")
+    "paused_reason", "pinned", "expected_revision", "request_id")
 
 
 def _cronjob_handler(args, **kw):

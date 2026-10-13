@@ -967,8 +967,12 @@ def cron_notepad(args) -> int:
         return 1
 
 
+from hermes_cli.cron_future_resume import command as future_resume_command
+
 # Late-bound lambdas keep module-level monkeypatching working; list/status/runs return None -> 0.
 _CRON_SUBCOMMANDS = {
+    "revision": future_resume_command,
+    "resume-future-only": future_resume_command,
     "list": lambda a: cron_list(getattr(a, "all", False)) or 0,
     "status": lambda a: cron_status() or 0,
     "doctor": lambda a: cron_doctor(),
