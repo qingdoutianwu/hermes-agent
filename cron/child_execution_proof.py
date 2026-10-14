@@ -16,6 +16,7 @@ from pathlib import Path
 import select
 import sqlite3
 import stat
+import sys
 import time
 
 MAX_BYTES = 4096
@@ -180,9 +181,15 @@ def _check_binding(body, trust, now):
         raise ProofError("PROOF_NATURAL_SOURCE_DENIED")
     if body["child_pid"] != os.getpid() or body["owner_pid"] != os.getppid():
         raise ProofError("PROOF_CHILD_BINDING_DENIED")
-    from gateway.status import get_process_start_time, start_time_fingerprints_match
-    owner_start = get_process_start_time(body["owner_pid"])
-    if owner_start is None or not start_time_fingerprints_match(body["owner_started_at"], owner_start):
+    # Match gateway.status's native ledger fingerprint without importing Gateway
+    # configuration into a sealed business consumer. macOS/Windows use psutil
+    # centiseconds; Linux's native row uses /proc start ticks.
+    if sys.platform == "linux":
+        owner_start = int(Path(f"/proc/{body['owner_pid']}/stat").read_text().split()[21])
+    else:
+        import psutil
+        owner_start = round(psutil.Process(body["owner_pid"]).create_time() * 100)
+    if abs(int(body["owner_started_at"]) - owner_start) > 200:
         raise ProofError("PROOF_OWNER_LIVENESS_DENIED")
     start, end = body["issued_at"], body["expires_at"]
     if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (start, end, now)):
