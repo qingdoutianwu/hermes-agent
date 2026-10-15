@@ -431,7 +431,9 @@ def _script_argv(
 
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
-    cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None,
+    interpreter: Optional[str] = None,
+    *, job: Optional[dict[str, Any]] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -480,6 +482,14 @@ def _run_job_script(
         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
+        proof_issue = None
+        if job is not None and job.get("no_agent") and job.get("execution_id") and job.get("_scheduled_instant"):
+            from cron.child_execution_proof import prepare_child, scrub_identity
+            scrub_identity(env)
+            proof_issue = prepare_child(path)
+            if proof_issue is not None:
+                popen_kwargs["stdin"] = subprocess.PIPE
+
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -487,6 +497,13 @@ def _run_job_script(
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=workdir or str(path.parent), env=env, **popen_kwargs)
+        if proof_issue is not None:
+            try:
+                proof_issue.deliver(proc)
+            except Exception:
+                _terminate_cron_script_tree(proc)
+                _drain_script_pipes(proc)
+                raise
         deadline = time.monotonic() + script_timeout
         while True:
             # Tree-kill on cancel AND timeout: killpg misses setsid grandchildren (watchdogs,
@@ -560,7 +577,7 @@ def _run_job_script_with_claim_heartbeat(
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
     def run() -> tuple[bool, str]:
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"))
+                               interpreter=job.get("interpreter"), job=job)
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")
