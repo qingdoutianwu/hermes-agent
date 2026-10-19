@@ -21,6 +21,11 @@ operator setting or long-lived secret. Other identity names match the existing
 consumer contract. No stdin is taken over and unrelated scripts may ignore the
 additive descriptor. Descriptors are closed on spawn/exit/error paths.
 
+R4 keeps pipe ownership in the spawn context manager and yields one delivery
+callback, removing the per-child class and mutable closed-descriptor sentinels.
+The parent admission and child consumption checks remain distinct trust boundaries;
+neither running-row validation nor the live parent fingerprint was removed.
+
 The child consumes the pipe once, checks child/parent PID, parent start fingerprint,
 the running native row's process instance/source/slot, home, expected Job and
 launcher, and equality of the identity environment to the authoritative frame.

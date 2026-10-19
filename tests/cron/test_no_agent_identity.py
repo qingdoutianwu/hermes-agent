@@ -248,3 +248,32 @@ def test_invalid_regular_file_descriptor_is_not_closed(tmp_path):
             is None
         )
         assert f.read() == b"untrusted"
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("spawn_failed", [False, True])
+def test_spawn_scope_closes_both_pipe_ends(tmp_path, monkeypatch, spawn_failed):
+    with owned(tmp_path, monkeypatch) as (home, job, _row):
+        descriptors = []
+        real_pipe = os.pipe
+
+        def capture_pipe():
+            pair = real_pipe()
+            descriptors.extend(pair)
+            return pair
+
+        monkeypatch.setattr(os, "pipe", capture_pipe)
+        env, options = {}, {"pass_fds": (123,)}
+        try:
+            with child_identity(
+                job, home / "scripts/probe.py", env, options
+            ) as deliver:
+                assert callable(deliver)
+                assert options["pass_fds"] == (123, descriptors[0])
+                if spawn_failed:
+                    raise RuntimeError("isolated spawn failure")
+        except RuntimeError:
+            assert spawn_failed
+        for descriptor in descriptors:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)

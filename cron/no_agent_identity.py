@@ -148,67 +148,49 @@ def _environment_values(body):
     }
 
 
-class _ChildIdentity:
-    def __init__(self, body):
-        self.body = body
-        self.reader, self.writer = os.pipe()
-
-    def deliver(self, process):
-        os.close(self.reader)
-        self.reader = -1
-        data = json.dumps(
-            dict(self.body, child_pid=process.pid), separators=(",", ":")
-        ).encode()
-        try:
-            if len(data) <= _MAX_BYTES:
-                os.write(self.writer, data)
-        except OSError:
-            # An unrelated script may exit without consuming the additive capability.
-            logger.debug("no-agent child exited without consuming native identity")
-        finally:
-            os.close(self.writer)
-            self.writer = -1
-        logger.info(
-            "no-agent identity job=%s execution=%s origin=%s slot=%s child_pid=%s",
-            self.body["job_id"],
-            self.body["execution_id"],
-            self.body["origin"],
-            self.body["scheduled_at"],
-            process.pid,
-        )
-
-    def close(self):
-        for descriptor in (self.reader, self.writer):
-            if descriptor >= 0:
-                os.close(descriptor)
-        self.reader = self.writer = -1
-
-
 @contextmanager
 def child_identity(job, launcher, env, popen_kwargs):
     """Scrub ambient identity, then attach an owned context for the actual spawn."""
     for key in IDENTITY_ENV:
         env.pop(key, None)
-    issue = None
+    body = None
+    if os.name == "posix" and job and job.get("no_agent"):
+        try:
+            body = _parent_identity(job, launcher)
+        except (OSError, sqlite3.Error, ValueError, TypeError):
+            logger.debug("native no-agent identity unavailable", exc_info=True)
+    if body is None:
+        yield None
+        return
+    reader, writer = os.pipe()
     try:
-        if os.name == "posix" and job and job.get("no_agent"):
+        env.update(_environment_values(body))
+        env[FD_ENV] = str(reader)
+        popen_kwargs["pass_fds"] = (*popen_kwargs.get("pass_fds", ()), reader)
+
+        def deliver(process):
+            data = json.dumps(
+                dict(body, child_pid=process.pid), separators=(",", ":")
+            ).encode()
             try:
-                body = _parent_identity(job, launcher)
-            except (OSError, sqlite3.Error, ValueError, TypeError):
-                body = None
-                logger.debug("native no-agent identity unavailable", exc_info=True)
-            if body is not None:
-                issue = _ChildIdentity(body)
-                env.update(_environment_values(body))
-                env[FD_ENV] = str(issue.reader)
-                popen_kwargs["pass_fds"] = (
-                    *popen_kwargs.get("pass_fds", ()),
-                    issue.reader,
-                )
-        yield issue
+                if len(data) <= _MAX_BYTES:
+                    os.write(writer, data)
+            except OSError:
+                # An unrelated script may ignore the additive capability.
+                logger.debug("no-agent child exited without consuming native identity")
+            logger.info(
+                "no-agent identity job=%s execution=%s origin=%s slot=%s child_pid=%s",
+                body["job_id"],
+                body["execution_id"],
+                body["origin"],
+                body["scheduled_at"],
+                process.pid,
+            )
+
+        yield deliver
     finally:
-        if issue is not None:
-            issue.close()
+        os.close(reader)
+        os.close(writer)
 
 
 def read_child_identity(*, expected_job_id, expected_launcher_path, environ=None):

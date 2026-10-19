@@ -486,12 +486,12 @@ def _run_job_script(
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
         # gateway sessions (#69396).
         from cron.no_agent_identity import child_identity
-        with child_identity(identity_job, path, env, popen_kwargs) as identity:
+        with child_identity(identity_job, path, env, popen_kwargs) as deliver_identity:
             proc = subprocess.Popen(
                 argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 cwd=workdir or str(path.parent), env=env, **popen_kwargs)
-            if identity is not None:
-                identity.deliver(proc)
+            if deliver_identity is not None:
+                deliver_identity(proc)
         deadline = time.monotonic() + script_timeout
         while True:
             # Tree-kill on cancel AND timeout: killpg misses setsid grandchildren (watchdogs,
