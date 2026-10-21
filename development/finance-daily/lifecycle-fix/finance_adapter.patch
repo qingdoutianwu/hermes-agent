@@ -1,0 +1,45 @@
+--- a/projects/finance-daily/hermes_browser_adapter.py
++++ b/projects/finance-daily/hermes_browser_adapter.py
+@@ -183,0 +184 @@
++        self.owned_close_capability = None
+@@ -255,0 +257,6 @@
++        # Create the existing native task Session before binding its exact object.
++        from tools.browser_tool_session import _get_session_info
++        _get_session_info(self.reference)
++        from tools.browser_owned_lifecycle import register_owned_chromium
++        self.owned_close_capability = register_owned_chromium(task_id=self.reference,
++            process=self.browser, profile=self.profile, endpoint=self.owned_cdp_url)
+@@ -408 +415 @@
+-        from tools.browser_cdp_tool import browser_cdp
++        from tools.browser_owned_lifecycle import close_owned_chromium
+@@ -410,2 +417 @@
+-            raw = browser_cdp('Browser.close', {}, timeout=2, task_id=self.reference)
+-            value = json.loads(raw)
++            value = close_owned_chromium(self.owned_close_capability, task_id=self.reference, timeout=2)
+@@ -413 +419 @@
+-                'api':'tools.browser_cdp_tool.browser_cdp:Browser.close', 'output_sha256':_hash(raw)})
++                'api':'tools.browser_owned_lifecycle.close_owned_chromium', 'output_sha256':_hash(value)})
+@@ -415 +421,3 @@
+-                    'error':None if value.get('success') is True else self._safe_error(value.get('error','UNKNOWN'))}
++                    'error':value.get('error_code'), 'dispatched':value.get('dispatched',False),
++                    'response_received':value.get('response_received',False),
++                    'native_exit_status':value.get('native_exit_status','OWNED_NATIVE_EXIT_UNPROVEN')}
+--- a/tests/finance_daily_native/test_reap_stability.py
++++ b/tests/finance_daily_native/test_reap_stability.py
+@@ -53 +53 @@
+-    def test_native_exit_request_uses_same_guarded_hermes_api_once(self):
++    def test_native_exit_request_uses_owned_capability_api_once(self):
+@@ -56,0 +57 @@
++            s.owned_close_capability=object()
+@@ -58 +59,3 @@
+-                  patch('tools.browser_cdp_tool.browser_cdp',return_value=json.dumps({'success':True})) as call):
++                  patch('tools.browser_owned_lifecycle.close_owned_chromium',return_value={
++                      'success':True,'dispatched':True,'response_received':True,
++                      'native_exit_status':'OWNED_PROCESS_EXIT_VERIFIED','error_code':None}) as call):
+@@ -61 +64,2 @@
+-            call.assert_called_once_with('Browser.close',{},timeout=2,task_id=s.reference)
++            self.assertTrue(r['dispatched']);self.assertTrue(r['response_received'])
++            call.assert_called_once_with(s.owned_close_capability,timeout=2,task_id=s.reference)
+@@ -66 +70 @@
+-            with patch('tools.browser_cdp_tool.browser_cdp') as call:
++            with patch('tools.browser_owned_lifecycle.close_owned_chromium') as call:

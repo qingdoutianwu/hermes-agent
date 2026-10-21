@@ -166,7 +166,7 @@ def _browser_cdp_private_guard(*, task_id: str, method: str, params: dict[str, A
 
 
 async def _cdp_call(ws_url: str, method: str, params: dict[str, Any], target_id: Optional[str],
-                    timeout: float) -> dict[str, Any]:
+                    timeout: float, *, _dispatch_observer=None) -> dict[str, Any]:
     """Make a single CDP call. With ``target_id``, ``Target.attachToTarget(flatten=True)`` multiplexes a
     page-level session over the browser-level WebSocket; without it ``method`` runs at browser level."""
     assert websockets is not None  # guarded by _WS_AVAILABLE at call-site
@@ -181,6 +181,8 @@ async def _cdp_call(ws_url: str, method: str, params: dict[str, Any], target_id:
             nonlocal next_id
             call_id, next_id = next_id, next_id + 1
             await ws.send(json.dumps({"id": call_id, **req}))
+            if _dispatch_observer is not None and what == f"waiting for response to {method}":
+                _dispatch_observer()
             deadline = asyncio.get_running_loop().time() + timeout
             while True:  # ignore events / out-of-order responses
                 remaining = deadline - asyncio.get_running_loop().time()

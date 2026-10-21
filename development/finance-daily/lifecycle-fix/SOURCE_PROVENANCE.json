@@ -1,0 +1,44 @@
+{
+  "schema": "finance-daily-r54-native-lifecycle-candidate-v1",
+  "task_id": "FINANCE_DAILY_R54_CHROMIUM_LIFECYCLE_FIX_R1",
+  "native_base_commit": "d923a5eb487a17c0a68801bba9ef0f56c81040a8",
+  "finance_consumer_base_commit": "15aee5aeb900ab3b1919d4cc87d727a3e07d8ce1",
+  "finance_activated_release": "r54-d1d2fbb14a438f85da523735",
+  "production_installed": false,
+  "business_core_unchanged": true,
+  "consumer_payload": "Reviewable patch only;not a published Finance successor;Portable/business-provenance regeneration and native-source binding remain a future qualified publication prerequisite.",
+  "qualification": "LATEST_TESTS_GREEN_WITH_OPEN_REAL_FIXTURE_CREATION_IDENTITY_REJECTION;NOT_READY_FOR_CONTROLLED_INSTALL",
+  "files": [
+    {
+      "path": "tools/browser_owned_lifecycle.py",
+      "sha256": "cc14bf0e2030a27f55b49208af45c601600373f9ad467218e1481a524fe64e40",
+      "bytes": 9034
+    },
+    {
+      "path": "tools/browser_cdp_tool.py",
+      "sha256": "bfa822ff26017c28056447e368f35837a8b72b0dfa3d09c5205d9e7ba2fb991c",
+      "bytes": 22655
+    },
+    {
+      "path": "tests/tools/test_browser_owned_lifecycle.py",
+      "sha256": "babd7315647bdad151d85eed8b8c0da824f729194599838349268da96614f280",
+      "bytes": 7984
+    },
+    {
+      "path": "tests/tools/test_browser_owned_chromium_live.py",
+      "sha256": "1e941a4f4538c3e2dcfca64407963e236a79cfd317be9b1028fd71b66d6fc050",
+      "bytes": 5509
+    },
+    {
+      "path": "development/finance-daily/lifecycle-fix/README.md",
+      "sha256": "d82407fd732439c3cc23fe843d3d48002ba05d484fb6fc9390d6aae2f09a1f87",
+      "bytes": 8301
+    },
+    {
+      "path": "development/finance-daily/lifecycle-fix/finance_adapter.patch",
+      "sha256": "174861966b37dc0c3e4923a9e5fea9b4423ecadecc962acadc9a5e4cc24f94d8",
+      "bytes": 2881
+    }
+  ],
+  "self_excluded": "development/finance-daily/lifecycle-fix/SOURCE_PROVENANCE.json"
+}
