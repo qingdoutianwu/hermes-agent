@@ -15,6 +15,7 @@ from tools import browser_cdp_tool as cdp
 from tools import browser_tool as bt
 from tools import browser_tool_eval_policy as policy
 from tests.waiting import wait_until
+from tests.tools.browser_fixture_identity import IdentityReceipt
 
 
 @contextmanager
@@ -25,25 +26,27 @@ def chromium(home, task, monkeypatch):
     assert Path(executable).is_file(), 'Explicit local Chromium Fixture executable unavailable'
     profile=home/'runtime/finance-daily/native-runs'/task/'profile'
     profile.mkdir(parents=True,mode=0o700)
+    directory = Path(os.environ['HERMES_E2E_ARTIFACTS']).resolve(strict=True) if os.environ.get('HERMES_E2E_ARTIFACTS') else None
+    receipt = IdentityReceipt(directory, task, executable, profile)
     p=subprocess.Popen([executable,'--headless=new','--remote-debugging-address=127.0.0.1',
         '--remote-debugging-port=0','--user-data-dir='+str(profile),
         '--proxy-server=http://127.0.0.1:9','--disable-background-networking',
         '--disable-component-update','--no-first-run','--no-default-browser-check','about:blank'],
         stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
     try:
+        receipt.process_started(p)
         active=profile/'DevToolsActivePort'
         assert wait_until(lambda:active.exists() and len(active.read_text().splitlines())==2,timeout=15)
         port,path=active.read_text().splitlines();endpoint='ws://127.0.0.1:'+port+path
         info={'owner_task_id':task,'session_key':task,'cdp_url':endpoint,'features':{'cdp_override':True}}
         monkeypatch.setitem(bt._active_sessions,task,info)
         monkeypatch.setenv('BROWSER_CDP_URL',endpoint)
-        import psutil
-        observed=psutil.Process(p.pid)
-        assert (tuple(p.args[1:])==tuple(observed.cmdline()[1:])
-                and Path(p.args[0]).resolve()==Path(observed.exe()).resolve()), {
-                    'creation_args':p.args,'observed_args':observed.cmdline(),
-                    'creation_executable':str(Path(p.args[0]).resolve()),'observed_executable':observed.exe()}
-        token=owned.register_owned_chromium(task_id=task,process=p,profile=profile,endpoint=endpoint)
+        assert receipt.observe_ready(p, profile, endpoint, info), receipt.data['precheck']
+        with monkeypatch.context() as registration_patch:
+            receipt.instrument_registration(registration_patch, owned)
+            token=owned.register_owned_chromium(task_id=task,process=p,profile=profile,endpoint=endpoint)
+        receipt.data['registration'] = 'PASS'
+        receipt.record('SESSION_REGISTERED')
         yield p,profile,endpoint,token
     finally:
         # Test hygiene only: act on this fixture's Popen child,never another task/browser.
@@ -51,6 +54,7 @@ def chromium(home, task, monkeypatch):
             p.terminate();p.wait(timeout=5)
         assert wait_until(lambda: _group_gone(p.pid),timeout=5)
         shutil.rmtree(profile)
+        receipt.cleanup(p, profile, _group_gone(p.pid))
 
 
 def _group_gone(group):
@@ -65,6 +69,11 @@ def _group_gone(group):
 
 @pytest.mark.platforms('macos')
 def test_two_real_chromiums_close_only_owned_parent_and_keep_private_guard(tmp_path,monkeypatch):
+    if os.environ.get('HERMES_E2E_ARTIFACTS'):
+        # Exclusive marker prevents accidental repeated live invocations in this audit directory.
+        with (Path(os.environ['HERMES_E2E_ARTIFACTS'])/'FIXTURE_INVOCATION.json').open('x') as f:
+            json.dump({'fixture_invocation_count': 1, 'max_browser_processes': 2,
+                       'target': 'about:blank', 'retry_count': 0}, f)
     home=tmp_path/'home';home.mkdir();monkeypatch.setenv('HERMES_HOME',str(home))
     with ExitStack() as stack:
         a=stack.enter_context(chromium(home,'fixture-a',monkeypatch))

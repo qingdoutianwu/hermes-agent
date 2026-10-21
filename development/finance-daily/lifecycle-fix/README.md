@@ -116,7 +116,7 @@ The final targeted native set passed132 tests and the staged thin-consumer busin
 set passed222 tests. However,an earlier resumed real Chromium Fixture was rejected
 at the creation-argv/executable equality gate while registering its second browser.
 The mismatch values were not in that earlier receipt. A diagnostic assertion now
-retains both values on any future failure,but the single bounded follow-up passed
+retains paired identity summaries on future failures,but the single bounded follow-up passed
 without reproducing the mismatch. No signal/URL/ownership gate was relaxed.
 
 This is an OPEN registration-reliability qualification issue,not evidence that a
@@ -126,3 +126,35 @@ fixed. Therefore this candidate is NOT ready for a controlled production install
 recommendation despite the latest green tests. Keep earlier failed/interrupted logs.
 The smallest remaining work is isolated reproduction of that exact creation identity
 read,not a new browser architecture or another Finance report run.
+
+## Creation identity diagnostic follow-up (2026-10-21)
+
+Task `FINANCE_DAILY_R54_CHROMIUM_FIXTURE_IDENTITY_R1` starts from candidate
+`fcb9e0fd96bad737d2af2735d12ba2241b997303`. Only the isolated test Harness and
+diagnostic contracts change; native implementation and Finance consumer payload do not.
+
+The test-only binding observer returns the original binding unchanged and records
+the exact arguments/executable used by the composite creation guard. The original
+guard always executes with the same boolean and exception semantics. Argument
+values are never serialized: position, length and SHA256 provide paired comparisons.
+Receipts include executable SHA/device/inode, Profile identity, child creation time,
+expected/actual parent/UID/group, Session owner and hashed CDP identity, first rejection,
+and cleanup. No environment, Cookie, credential, browser payload or raw exception is saved.
+Per-process execution architecture is UNAVAILABLE when the native observation cannot
+provide it; host/binary arm64 is not substituted as a measured process architecture.
+
+Eight offline diagnostic contracts passed. Exactly one live Fixture invocation,
+using the original two independent Chromium children and about:blank only, passed.
+Both precheck and actual native binding comparisons matched, both child exits were
+verified and both Profiles/process groups were released. No second invocation or
+full regression matrix was run. Prior132 native and222 business results are reused
+historical evidence, not newly executed tests.
+
+The earlier failure still lacks its concrete expected/actual values and executable
+snapshot: `HISTORICAL_MISMATCH_NOT_CAPTURED`, root cause `NOT_PROVEN`. The native
+Session-object binding added after that failure occurs after the creation equality
+gate and cannot be asserted to fix it. Diagnostic reads add observation time and may
+affect a timing-sensitive reproduction; a non-reproduction does not exclude a race.
+There is no evidence to choose parameter construction, executable mismatch, child
+binding, Profile/CDP mismatch or a race as the historical cause. No behavioral fix
+is justified. Controlled-install readiness remains false pending independent admission.

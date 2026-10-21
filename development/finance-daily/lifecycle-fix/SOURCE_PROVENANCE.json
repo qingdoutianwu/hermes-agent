@@ -7,7 +7,7 @@
   "production_installed": false,
   "business_core_unchanged": true,
   "consumer_payload": "Reviewable patch only;not a published Finance successor;Portable/business-provenance regeneration and native-source binding remain a future qualified publication prerequisite.",
-  "qualification": "LATEST_TESTS_GREEN_WITH_OPEN_REAL_FIXTURE_CREATION_IDENTITY_REJECTION;NOT_READY_FOR_CONTROLLED_INSTALL",
+  "qualification": "CURRENT_SINGLE_FIXTURE_PASS_HISTORICAL_MISMATCH_NOT_CAPTURED_NOT_READY_FOR_INSTALL",
   "files": [
     {
       "path": "tools/browser_owned_lifecycle.py",
@@ -26,19 +26,31 @@
     },
     {
       "path": "tests/tools/test_browser_owned_chromium_live.py",
-      "sha256": "1e941a4f4538c3e2dcfca64407963e236a79cfd317be9b1028fd71b66d6fc050",
-      "bytes": 5509
+      "sha256": "3fd88f42c202d5fbcbbbc549d3a4b7d5022a030b6f0d8baa6bcd8e03d0759e72",
+      "bytes": 6175
     },
     {
       "path": "development/finance-daily/lifecycle-fix/README.md",
-      "sha256": "d82407fd732439c3cc23fe843d3d48002ba05d484fb6fc9390d6aae2f09a1f87",
-      "bytes": 8301
+      "sha256": "4a30e291d246f8f434d7618a209da72b7b4f3d044466255eb1ef15cfcc5abd04",
+      "bytes": 10506
     },
     {
       "path": "development/finance-daily/lifecycle-fix/finance_adapter.patch",
       "sha256": "174861966b37dc0c3e4923a9e5fea9b4423ecadecc962acadc9a5e4cc24f94d8",
       "bytes": 2881
+    },
+    {
+      "path": "tests/tools/browser_fixture_identity.py",
+      "sha256": "6dc166152daa4d0e2f02a8daf303297a5c414ea640cc0cfc303b44077fdbc160",
+      "bytes": 6855
+    },
+    {
+      "path": "tests/tools/test_browser_fixture_identity.py",
+      "sha256": "65c4da43a68cf790d44a1d68726d5f9b0f3bcf7dee4d362d3df71230fc4e4e23",
+      "bytes": 3699
     }
   ],
-  "self_excluded": "development/finance-daily/lifecycle-fix/SOURCE_PROVENANCE.json"
+  "self_excluded": "development/finance-daily/lifecycle-fix/SOURCE_PROVENANCE.json",
+  "diagnostic_task_id": "FINANCE_DAILY_R54_CHROMIUM_FIXTURE_IDENTITY_R1",
+  "diagnostic_base_candidate": "fcb9e0fd96bad737d2af2735d12ba2241b997303"
 }
