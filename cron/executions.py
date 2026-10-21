@@ -60,6 +60,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         """CREATE TABLE IF NOT EXISTS executions (
              id TEXT PRIMARY KEY,
              job_id TEXT NOT NULL,
+             profile TEXT,
              source TEXT NOT NULL,
              process_id TEXT NOT NULL,
              pid INTEGER NOT NULL,
@@ -81,6 +82,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(
         conn, "executions", "handoff_started_at", "handoff_started_at REAL"
     )
+    add_column_if_missing(conn, "executions", "profile", "profile TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -92,6 +94,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
     add_column_if_missing(conn, "executions", "progress_at", "progress_at TEXT")
+    add_column_if_missing(conn, "executions", "origin_proof_sha256", "origin_proof_sha256 TEXT")
+    add_column_if_missing(conn, "executions", "origin_proof_used", "origin_proof_used INTEGER NOT NULL DEFAULT 0")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
@@ -219,13 +223,16 @@ def create_execution(
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
+    from hermes_cli.profiles import current_profile_name
+
+    profile = current_profile_name("default") or "default"
     with _transaction() as conn:
         conn.execute(
             """INSERT INTO executions
-               (id, job_id, source, process_id, pid, process_started_at,
+               (id, job_id, profile, source, process_id, pid, process_started_at,
                 status, claimed_at, scheduled_instant)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
-            (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
+            (execution_id, str(job_id), profile, str(source), _PROCESS_ID, pid,
              _process_start_time(pid), now, canonical_instant(scheduled_instant)),
         )
         record = _fetch(conn, execution_id)

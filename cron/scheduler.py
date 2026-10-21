@@ -2790,6 +2790,7 @@ def run_one_job(
     note_cron_execution(job)
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
     if not external_owner:
+        authority_required = str(job.get("_r2_authority_required") or "").lower() == "true"
         try:
             handed_off = _launch_external_cron_worker(job)
         except Exception as handoff_error:
@@ -2838,6 +2839,18 @@ def run_one_job(
 
             record_unknown_worker_outcome(job, adapters=adapters, loop=loop)
             return True
+        if authority_required:
+            error = "R2 authority-required job could not be dispatched to an external worker"
+            logger.error("Job '%s': %s", job["id"], error)
+            claim = job.get("fire_claim")
+            owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+            if owner:
+                mark_job_run(job["id"], False, error, expected_fire_owner=owner)
+            else:
+                mark_job_run(job["id"], False, error)
+            finish_execution(execution_id, success=False, error=error)
+            return True
+
     if extra_prompt is None:
         # Gateway-forwarded manual run stamps its prompt on the job via trigger_job; the fire that
         # consumes the manual occurrence picks it up here. Single-fire: mark_job_run clears it.
@@ -3659,6 +3672,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
     from cron.scheduler_provider import routed_profile_fire
     from tools.environments.local import build_subprocess_env, strip_launch_profile_env
     from tools.process_registry import (
+        GatewayChildDispatch,
         restart_safe_gateway_child_argv,
         scoped_spawn_lost_user_bus,
         systemd_user_bus_env,
@@ -3680,6 +3694,10 @@ def _launch_external_cron_worker(job: dict) -> bool:
         unit_suffix=f"cron-{job_id}-exec-{execution_id}",
         require_restart_safe_scope=require_restart_safe_scope,
     )
+    if dispatch.mode == "in_process" and str(job.get("_r2_authority_required") or "").lower() == "true":
+        # An authority-required candidate must cross a real process boundary even on macOS,
+        # where the restart-safe systemd helper intentionally returns in_process for legacy jobs.
+        dispatch = GatewayChildDispatch("degraded", command)
     if dispatch.mode == "in_process":
         return False
 
@@ -3893,6 +3911,7 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
         set_secret_scope,
     )
     from cron.executions import adopt_claimed_execution
+    from cron.scheduler_detached_worker import prepare_external_worker_ack
     from hermes_cli.env_loader import hydrate_profile_secret_sources
     from hermes_constants import (
         reset_hermes_home_override,
@@ -3930,30 +3949,7 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
                     execution_id,
                 )
                 return False
-            try:
-                ack_path.parent.mkdir(parents=True, exist_ok=True)
-                # Publish via write-to-temp + atomic rename. Writing ack_path in place
-                # (the old approach) let O_CREAT make the empty file visible to the
-                # scheduler's exists()-then-read polling loop before the JSON body was
-                # written, occasionally handing it a 0-byte file and a JSONDecodeError.
-                # os.replace() is a single atomic syscall on the same filesystem, so
-                # readers only ever see the file fully absent or fully written.
-                ack_tmp_path = ack_path.with_name(f"{ack_path.name}.tmp{os.getpid()}")
-                fd = os.open(ack_tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as ack_file:
-                        json.dump({"pid": os.getpid(), "execution_id": execution_id}, ack_file)
-                        ack_file.flush()
-                        os.fsync(ack_file.fileno())
-                    os.replace(ack_tmp_path, ack_path)
-                except BaseException:
-                    ack_tmp_path.unlink(missing_ok=True)
-                    raise
-            except Exception:
-                logger.exception(
-                    "Cron external worker could not publish ready acknowledgement for %s",
-                    execution_id,
-                )
+            if not prepare_external_worker_ack(job, execution_id, ack_path):
                 return False
             old_external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
             os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = execution_id
@@ -3970,6 +3966,9 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
                 else:
                     os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = old_external_execution
     finally:
+        authority = job.pop("_r2_authority", None)
+        if authority is not None:
+            authority.close()
         if secret_token is not None:
             reset_secret_scope(secret_token)
         set_multiplex_active(previous_multiplex)

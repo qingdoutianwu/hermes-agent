@@ -15,7 +15,31 @@ JOB_DEFINITION_FIELDS = frozenset({
     "script", "no_agent", "monitor_script", "monitor_url", "context_from",
     "schedule", "schedule_display", "deliver", "origin", "enabled_toolsets",
     "workdir", "attach_to_session", "reasoning_effort", "failure_deliver",
+    "_r2_authority_required", "_r2_release_manifest",
 })
+
+
+def normalize_job_updates(job: dict[str, Any], updates: dict[str, Any]) -> None:
+    """Normalize authored updates before merging into the persisted Job.
+
+    Late-bind the store's normalizers, preserving its field whitelist and test
+    seams without a module-import cycle. Repeat edits retain completed counters.
+    """
+    from cron import jobs
+
+    for key, norm in jobs._UPDATE_FIELD_NORMALIZERS.items():
+        if key in updates:
+            updates[key] = norm(updates[key])
+    if "repeat" in updates:
+        _rp = updates["repeat"]
+        completed = (job.get("repeat") or {}).get("completed", 0)
+        if isinstance(_rp, dict):
+            _rp = dict(_rp)
+            _rp["times"] = jobs.normalize_repeat_value(_rp.get("times"))
+            _rp.setdefault("completed", completed)
+            updates["repeat"] = _rp
+        else:
+            updates["repeat"] = {"times": jobs.normalize_repeat_value(_rp), "completed": completed}
 
 
 def merge_job_definition(local: dict[str, Any], authored: dict[str, Any]) -> dict[str, Any]:
@@ -25,6 +49,12 @@ def merge_job_definition(local: dict[str, Any], authored: dict[str, Any]) -> dic
     past one-shot for a live job)."""
     merged = {key: value for key, value in local.items() if key not in JOB_DEFINITION_FIELDS}
     merged.update((key, authored[key]) for key in JOB_DEFINITION_FIELDS if key in authored)
+    if "_r2_authority_required" in authored:
+        merged["_r2_authority_required"] = str(authored["_r2_authority_required"] or "false").lower()
+    elif "_r2_authority_required" not in local:
+        merged["_r2_authority_required"] = "false"
+    if "_r2_release_manifest" in authored:
+        merged["_r2_release_manifest"] = authored["_r2_release_manifest"]
     merged["repeat"] = {
         "completed": (local.get("repeat") or {}).get("completed", 0),
         "times": (authored.get("repeat") or {}).get("times"),

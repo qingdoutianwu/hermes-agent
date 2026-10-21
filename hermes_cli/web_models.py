@@ -328,6 +328,8 @@ class CronJobCreate(BaseModel):
     enabled_toolsets: Optional[list[str]] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+    r2_authority_required: bool = False
+    r2_release_manifest: Optional[str] = None
 
 class CronJobUpdate(BaseModel):
     updates: dict

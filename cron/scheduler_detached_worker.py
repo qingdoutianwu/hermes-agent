@@ -1,4 +1,4 @@
-"""Cron: teardown of a worker that outlived its ``run_job``.
+"""Cron: worker readiness publication and detached-worker teardown.
 
 ``ThreadPoolExecutor.shutdown(wait=False)`` after an inactivity timeout does not stop a
 worker already inside ``run_conversation``. Finalizing its SessionDB from ``run_job``'s
@@ -12,7 +12,50 @@ import concurrent.futures
 import contextlib
 import subprocess
 import threading
+from pathlib import Path
 from typing import Optional
+
+
+def prepare_external_worker_ack(job: dict, execution_id: str, ack_path: Path) -> bool:
+    """Initialize optional Authority and atomically publish an adopted worker's ACK.
+
+    The scheduler still owns adoption, profile scope, dispatch and final teardown.
+    Keep initialization before ACK and never acknowledge a refused Authority.
+    Facade names are late-bound to preserve its native error-reporting seams.
+    """
+    from cron import scheduler
+    from cron.scheduler_origin_auth import ScriptOriginAuthority
+    logger = scheduler.logger
+
+    if str(job.get("_r2_authority_required") or "").lower() == "true":
+        try:
+            if not job.get("no_agent"):
+                raise ValueError("ORIGIN_AUTHORITY_REQUIRES_NO_AGENT")
+            job["_r2_authority"] = ScriptOriginAuthority(job)
+        except (OSError, ValueError, RuntimeError) as exc:
+            scheduler.finish_execution(execution_id, success=False, error=f"Origin authority refused: {exc}")
+            logger.exception("Cron authority initialization refused %s", execution_id)
+            return False
+    try:
+        ack_path.parent.mkdir(parents=True, exist_ok=True)
+        # An exclusive temporary file plus same-directory rename prevents a
+        # polling parent from observing a zero-byte/partially-written ACK.
+        ack_tmp_path = ack_path.with_name(f"{ack_path.name}.tmp{scheduler.os.getpid()}")
+        fd = scheduler.os.open(ack_tmp_path, scheduler.os.O_WRONLY | scheduler.os.O_CREAT | scheduler.os.O_EXCL, 0o600)
+        try:
+            with scheduler.os.fdopen(fd, "w", encoding="utf-8") as ack_file:
+                scheduler.json.dump({"pid": scheduler.os.getpid(), "execution_id": execution_id}, ack_file)
+                ack_file.flush()
+                scheduler.os.fsync(ack_file.fileno())
+            scheduler.os.replace(ack_tmp_path, ack_path)
+        except BaseException:
+            ack_tmp_path.unlink(missing_ok=True)
+            raise
+    except Exception:
+        logger.exception(
+            "Cron external worker could not publish ready acknowledgement for %s", execution_id)
+        return False
+    return True
 
 
 def _close_late_session_db_result(future: concurrent.futures.Future) -> None:

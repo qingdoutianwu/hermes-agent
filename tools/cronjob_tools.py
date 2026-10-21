@@ -698,6 +698,8 @@ def _action_create(a: dict[str, Any]) -> str:
             reasoning_effort=a["reasoning_effort"], interpreter=a["interpreter"],
             pinned=bool(a["pinned"]),
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
+            r2_authority_required=bool(a["r2_authority_required"]),
+            r2_release_manifest=_normalize_optional_job_value(a["r2_release_manifest"]),
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
     except CronSchedulerRegistrationError as exc:
@@ -932,6 +934,10 @@ def _update_run_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str
         if job.get("state") != "paused":
             updates["state"] = "scheduled"
             updates["enabled"] = True
+    if a["r2_authority_required"] is not None:
+        updates["_r2_authority_required"] = bool(a["r2_authority_required"])
+    if a["r2_release_manifest"] is not None:
+        updates["_r2_release_manifest"] = _normalize_optional_job_value(a["r2_release_manifest"]) or None
     return None
 
 
@@ -1014,7 +1020,9 @@ def cronjob(
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: Optional[bool] = None,
-    interpreter: Optional[str] = None) -> str:
+    interpreter: Optional[str] = None,
+    r2_authority_required: Optional[bool] = None,
+    r2_release_manifest: Optional[str] = None) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
@@ -1136,7 +1144,15 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "workdir": {
                 "type": "string",
-                "description": "Optional absolute existing path to run the job from: injects that directory's AGENTS.md/context files and anchors terminal/file tools there. On update, '' clears."
+                "description": "Optional absolute existing path to run the job from: injects that directory's AGENTS.md/context files and anchors terminal cwd. On update, '' clears."
+            },
+            "r2_authority_required": {
+                "type": "boolean",
+                "description": "Candidate-only opt-in: require native R2 authority for this no_agent job. Defaults false."
+            },
+            "r2_release_manifest": {
+                "type": "string",
+                "description": "Candidate-only canonical release manifest path used with r2_authority_required."
             },
             "attach_to_session": {
                 "type": "boolean",
@@ -1170,7 +1186,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned")
+    "paused_reason", "pinned", "r2_authority_required", "r2_release_manifest")
 
 
 def _cronjob_handler(args, **kw):

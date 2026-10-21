@@ -525,6 +525,12 @@ def _normalize_job_record(job: dict[str, Any]) -> dict[str, Any]:
     # Derived from the scheduler-honoured ``enabled`` flag so a half-paused record cannot render
     # "paused" while still firing. See effective_job_state().
     normalized["state"] = effective_job_state(normalized)
+    normalized["_r2_authority_required"] = str(
+        normalized.get("_r2_authority_required") or "false"
+    ).lower()
+    normalized["_r2_release_manifest"] = _normalize_job_optional_text(
+        normalized.get("_r2_release_manifest")
+    )
     return normalized
 
 
@@ -1756,6 +1762,8 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
     "interpreter": _normalize_job_optional_text,
+    "r2_authority_required": lambda value: str(value).lower() == "true" if isinstance(value, str) else bool(value),
+    "r2_release_manifest": _normalize_job_optional_text,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1765,6 +1773,8 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "monitor_url": _normalize_job_optional_text,
     "interpreter": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "_r2_authority_required": lambda value: str(value).lower() == "true" if isinstance(value, str) else bool(value),
+    "_r2_release_manifest": _normalize_job_optional_text,
 }
 
 
@@ -1836,6 +1846,8 @@ def create_job(
     paused_reason: Optional[str] = None,
     pinned: bool = False,
     interpreter: Optional[str] = None,
+    r2_authority_required: bool | str = False,
+    r2_release_manifest: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1927,6 +1939,8 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": f["enabled_toolsets"],
         "workdir": f["workdir"],
+        "_r2_authority_required": str(r2_authority_required).lower() if isinstance(r2_authority_required, str) else ("true" if r2_authority_required else "false"),
+        "_r2_release_manifest": _coerce_job_text(r2_release_manifest) if r2_release_manifest else None,
     }
     # Optional keys are persisted only when explicitly set: an absent key falls back to global
     # config (attach/reasoning) or to ``deliver`` (failure_deliver), byte-identical to pre-feature
@@ -2027,24 +2041,6 @@ def _apply_pin_update(job: dict[str, Any], updates: dict[str, Any]) -> None:
         updates["provider"], updates["model"] = None, None
 
 
-def _normalize_job_updates(job: dict[str, Any], updates: dict[str, Any]) -> None:
-    """Normalize updates in place like create_job; invalid values raise BEFORE the merge. ``repeat``
-    accepts the stored dict or a bare value (coerced, completed counter preserved)."""
-    for key, norm in _UPDATE_FIELD_NORMALIZERS.items():
-        if key in updates:
-            updates[key] = norm(updates[key])
-    if "repeat" in updates:
-        _rp = updates["repeat"]
-        completed = (job.get("repeat") or {}).get("completed", 0)
-        if isinstance(_rp, dict):
-            _rp = dict(_rp)
-            _rp["times"] = normalize_repeat_value(_rp.get("times"))
-            _rp.setdefault("completed", completed)
-            updates["repeat"] = _rp
-        else:
-            updates["repeat"] = {"times": normalize_repeat_value(_rp), "completed": completed}
-
-
 def _rederive_repeat_for_schedule_change(
     job: dict[str, Any], updates: dict[str, Any]
 ) -> None:
@@ -2116,8 +2112,9 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
         raise ValueError(f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}")
 
     def apply(jobs, i, job):
+        from cron.job_definition import normalize_job_updates
         _rederive_repeat_for_schedule_change(job, updates)
-        _normalize_job_updates(job, updates)
+        normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
         _reject_terminal_activation(job, updated, job_id)

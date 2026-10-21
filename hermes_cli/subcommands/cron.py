@@ -81,6 +81,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Absolute or ~ path to a Python in your own venv (e.g. ~/venvs/report/bin/python) "
             "for a .py --script / --monitor-script, so it can import packages Hermes does not "
             "ship. .sh/.bash still run under bash. Omit to use Hermes' Python.")
+    _flag(cron_create, "--r2-authority-required", dest="r2_authority_required", default=False,
+        help="Candidate-only: require native R2 authority for this no-agent job.")
+    cron_create.add_argument("--r2-release-manifest", dest="r2_release_manifest",
+        help="Candidate-only canonical release manifest path for R2 authority.")
     cron_create.add_argument(
         "--continuity", dest="continuity", action="store_const", const=True, default=None,
         help="Each run wakes up with the job's own previous output injected "
@@ -151,6 +155,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--interpreter",
         help="Absolute or ~ path to a Python for a .py script / monitor script. "
             "Pass empty string to clear (back to Hermes' Python).")
+    cron_edit.add_argument("--r2-authority-required", dest="r2_authority_required",
+        action="store_const", const=True, default=None,
+        help="Candidate-only: require native R2 authority for this job.")
+    cron_edit.add_argument("--no-r2-authority", dest="r2_authority_required",
+        action="store_const", const=False,
+        help="Candidate-only: disable R2 authority requirement.")
+    cron_edit.add_argument("--r2-release-manifest", dest="r2_release_manifest",
+        help="Candidate-only canonical release manifest path; empty clears.")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

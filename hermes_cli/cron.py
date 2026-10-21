@@ -759,7 +759,9 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("model", "model"), ("provider", "model_provider"), ("pinned", "pinned"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
-                   ("interpreter", "interpreter"))
+                   ("interpreter", "interpreter"),
+                   ("r2_authority_required", "r2_authority_required"),
+                   ("r2_release_manifest", "r2_release_manifest"))
 
 
 def _job_api_kwargs(args) -> dict[str, Any]:
@@ -800,6 +802,8 @@ def cron_create(args):
         return 1
     print(color(f"Created job: {result['job_id']}", Colors.GREEN))
     print(f"  Name: {result['name']}\n  Schedule: {result['schedule']}")
+    if result.get("job", {}).get("_r2_authority_required") == "true":
+        print("  R2 authority: required")
     if result.get("skills"):
         print(f"  Skills: {', '.join(result['skills'])}")
     _print_job_details(result.get("job", {}))
@@ -846,6 +850,8 @@ def cron_edit(args):
     updated = result["job"]
     print(color(f"Updated job: {updated['job_id']}", Colors.GREEN))
     print(f"  Name: {updated['name']}\n  Schedule: {updated['schedule']}")
+    if updated.get("_r2_authority_required") == "true":
+        print("  R2 authority: required")
     print(f"  Skills: {', '.join(updated['skills'])}" if updated.get("skills") else
           "  Skills: none")
     _print_job_details(updated)

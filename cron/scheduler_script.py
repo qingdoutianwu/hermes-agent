@@ -293,6 +293,41 @@ def _drain_script_pipes(proc: subprocess.Popen) -> None:
         proc.wait(timeout=5.0)
 
 
+def _reap_authority_failed_script(proc: subprocess.Popen, cause: BaseException) -> None:
+    """Keep ownership until handshake failure cleanup finishes; never replace its cause.
+
+    Reuse timeout tree-kill/drain, but run the drain even if termination races or
+    raises. Popen's own kill/wait is the final bounded fallback for this child only.
+    Interrupts must also reap before propagating; cleanup failure remains auditable.
+    """
+    for cleanup in (_terminate_cron_script_tree, _drain_script_pipes):
+        try:
+            cleanup(proc)
+        except BaseException as cleanup_error:
+            cause.add_note(f"{cleanup.__name__}: {type(cleanup_error).__name__}: {cleanup_error}")
+            logger.warning("Authority-failed child %s cleanup failed in %s",
+                           proc.pid, cleanup.__name__, exc_info=True)
+    try:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+    except BaseException as cleanup_error:
+        cause.add_note(f"Final child reap: {type(cleanup_error).__name__}: {cleanup_error}")
+        logger.warning("Authority-failed child %s final reap failed", proc.pid, exc_info=True)
+    for stream in (proc.stdout, proc.stderr):
+        try:
+            if stream is not None:
+                stream.close()
+        except Exception as cleanup_error:
+            cause.add_note(f"Child pipe close: {type(cleanup_error).__name__}: {cleanup_error}")
+            logger.warning("Authority-failed child %s pipe close failed", proc.pid, exc_info=True)
+    if proc.returncode is None:
+        cause.add_note("CHILD_REAP_UNVERIFIED: owned child may still be alive")
+        logger.error("CHILD_REAP_UNVERIFIED for authority-failed child %s", proc.pid)
+    logger.error("Cron script authority failed for child %s", proc.pid,
+                 exc_info=(type(cause), cause, cause.__traceback__))
+
+
 def _windows_cron_bootstrap_argv(
     python_exe: str, env_overlay: dict[str, str], script_path: str) -> list[str]:
     """Bootstrap a cron script under the base interpreter with ``.pth`` support. Overlay mode puts
@@ -432,6 +467,7 @@ def _script_argv(
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+    *, job: Optional[dict[str, Any]] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -480,6 +516,14 @@ def _run_job_script(
         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
+        authority = None
+        if job is not None and str(job.get("_r2_authority_required") or "").lower() == "true" and job.get("_r2_authority") is None:
+            raise RuntimeError("ORIGIN_AUTHORITY_REQUIRED; refusing script without native authority")
+        if job is not None and job.get("_r2_authority") is not None:
+            from cron.scheduler_origin_auth import authoritative_environment
+
+            authority = job["_r2_authority"]
+            authoritative_environment(env, authority)
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -487,6 +531,12 @@ def _run_job_script(
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=workdir or str(path.parent), env=env, **popen_kwargs)
+        if authority is not None:
+            try:
+                authority.consume(proc.pid)
+            except BaseException as exc:
+                _reap_authority_failed_script(proc, exc)
+                raise
         deadline = time.monotonic() + script_timeout
         while True:
             # Tree-kill on cancel AND timeout: killpg misses setsid grandchildren (watchdogs,
@@ -560,7 +610,7 @@ def _run_job_script_with_claim_heartbeat(
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
     def run() -> tuple[bool, str]:
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"))
+                               interpreter=job.get("interpreter"), job=job)
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")

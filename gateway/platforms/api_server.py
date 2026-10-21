@@ -299,7 +299,7 @@ def _clean_request_string(value: Any) -> Optional[str]:
 # model_options decoding lives in the topical sibling (line-cap offset);
 # re-exported here so importers are unaffected.
 from gateway.platforms.api_server_request_options import (
-    _request_reasoning_config, _request_service_tier)
+    _request_reasoning_config, _request_service_tier, _cron_create_options, _cron_update_options)
 
 
 def _apply_runtime_agent_overrides(
@@ -3804,7 +3804,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     _JOB_ID_RE = re.compile(r"[a-f0-9]{12}")
     # Update whitelist — prevents clients injecting arbitrary keys.
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled", "r2_authority_required", "r2_release_manifest"}
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -3881,7 +3881,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             name = (body.get("name") or "").strip()
             schedule = (body.get("schedule") or "").strip()
             prompt = body.get("prompt", "")
-            skills = body.get("skills")
             repeat = body.get("repeat")
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -3894,17 +3893,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 return prompt_err
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
-            kwargs = {
-                "prompt": prompt, "schedule": schedule, "name": name,
-                "deliver": body.get("deliver", "local"),
-                "origin": self._cron_origin_from_request(request)}
-            for key in ("paused", "paused_reason"):
-                if key in body:
-                    kwargs[key] = body[key]
-            if skills:
-                kwargs["skills"] = skills
-            if repeat is not None:
-                kwargs["repeat"] = repeat
+            kwargs = _cron_create_options(body, origin=self._cron_origin_from_request(request),
+                                          authenticated=bool(self._expected_api_key()))
             return web.json_response({"job": _cron_create(**kwargs)})
         except _CronSchedulerRegistrationError as e:
             return web.json_response(e.to_dict(), status=424)
@@ -3925,7 +3915,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         try:
             body = await request.json()
             # Whitelist allowed fields to prevent arbitrary key injection
-            sanitized = {k: v for k, v in body.items() if k in self._UPDATE_ALLOWED_FIELDS}
+            sanitized = _cron_update_options(body, self._UPDATE_ALLOWED_FIELDS,
+                authenticated=bool(self._expected_api_key()), job_id=job_id)
             if not sanitized:
                 return web.json_response({"error": "No valid fields to update"}, status=400)
             if "name" in sanitized and len(sanitized["name"]) > self._MAX_NAME_LENGTH:
@@ -3934,6 +3925,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 prompt_err = self._validate_cron_prompt(sanitized["prompt"])
                 if prompt_err:
                     return prompt_err
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             return self._cron_error_response(e)
         return self._job_response(lambda jid: _cron_update(jid, sanitized), job_id, notify=True)
