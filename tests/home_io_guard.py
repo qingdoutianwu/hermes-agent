@@ -47,7 +47,7 @@ def _contains(path: str, prefix: str) -> bool:
 
 
 class HomeIOGuard:
-    def __init__(self, roots, installed_apps=lambda: ()):
+    def __init__(self, roots, installed_apps=lambda: (), *, checkout_root: Path | None = None):
         self.roots = roots
         # The machine's installed desktop app (``packaged_gui_app_paths()`` before any test ran):
         # deleting, replacing or writing into it is refused. Reads stay allowed: several update
@@ -55,6 +55,10 @@ class HomeIOGuard:
         self.installed_apps = installed_apps
         self.checking = threading.local()
         self.directories: dict[int, Path] = {}
+        self.checkout_manifest_probe = (
+            _normcase(os.fspath(Path(checkout_root).resolve().parent / "manifest.json"))
+            if checkout_root is not None else None
+        )
 
     def check(self, value, *, dir_fd=None, metadata=False, destructive=False):
         if value is None or isinstance(value, int) or getattr(self.checking, "active", False):
@@ -75,6 +79,16 @@ class HomeIOGuard:
                     raise AssertionError("TEST BUG: untracked dir_fd in guarded filesystem I/O")
                 candidate = os.path.join(os.fspath(parent), candidate)
             absolute = _normcase(os.path.abspath(candidate))
+            # PM checks for a sealed-payload manifest beside the source checkout. In a linked
+            # worktree that is an intentionally absent path under the operator's guarded home.
+            # Permit only this exact, absent, read-only probe; an existing file, symlink or write
+            # remains protected. The real stat/open still runs and receives its normal ENOENT.
+            if (
+                not destructive
+                and absolute == self.checkout_manifest_probe
+                and not os.path.lexists(absolute)
+            ):
+                return
             # /proc/<pid>/fd/N is descriptor inspection (deleted-WAL holder scans stat the magic
             # link to compare inode identity); resolving it names whatever file that fd holds,
             # which is not I/O against the home.

@@ -4,11 +4,13 @@
 
 import contextlib
 import copy
+import hashlib
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 import json
 import logging
 import shutil
+import stat
 import sys
 import threading
 import time
@@ -30,6 +32,7 @@ from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
+from cron.jobs_store_runtime import store_and_dispatch_fence
 from cron.env_settings import cron_env_setting
 from cron.scheduler_ownership import _claim_owner_is_dead
 from cron import store_health
@@ -286,15 +289,20 @@ def _release_flock(lock_fd) -> None:
 
 
 @contextlib.contextmanager
-def _jobs_lock():
+def _jobs_lock(*, strict: bool = False):
     """Serialize a load_jobs→modify→save_jobs critical section: in-process RLock (parallel tick
     threads) plus a cross-process flock on ``<cron dir>/.jobs.lock`` (gateway vs. CLI writes —
     otherwise a `cron pause` could be clobbered and keep firing). Nested calls in one thread
     reuse the held lock. Without a flock backend, or on flock timeout (logged loudly), it
     degrades to in-process-only locking: a briefly torn cross-process write beats a dead
     scheduler."""
+    store_identity = str(_jobs_lock_file().resolve())
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
+        if getattr(_jobs_lock_state, "store_identity", None) != store_identity:
+            raise RuntimeError("Job Store identity changed inside a held Job Store lock")
+        if strict and not getattr(_jobs_lock_state, "cross_process", False):
+            raise RuntimeError("strict Job Store lock unavailable; rearm refused")
         _jobs_lock_state.depth = depth + 1
         try:
             yield
@@ -304,18 +312,24 @@ def _jobs_lock():
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
+        _jobs_lock_state.store_identity = store_identity
         # jobs.json stamp as of this section's load_jobs(): lets _save_jobs_unlocked skip the
         # shrink-merge parse when the file provably hasn't changed. Reset on entry/exit so stale
         # stamps from unlocked loads or prior sections can never suppress a needed merge.
         # See #80703.
         _jobs_lock_state.load_stamp = None
+        _jobs_lock_state.cross_process = False
         lock_fd = None
         try:
             try:
                 ensure_dirs()
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8-sig")
                 lock_fd.seek(0)
-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
+                acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
+                _jobs_lock_state.cross_process = acquired is True
+                if strict and acquired is not True:
+                    raise RuntimeError("strict Job Store lock unavailable; rearm refused")
+                if acquired is False:
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
@@ -326,17 +340,19 @@ def _jobs_lock():
                         lock_fd.close()
                     lock_fd = None
             except OSError as e:
+                if strict:
+                    raise RuntimeError("strict Job Store lock unavailable; rearm refused") from e
                 # A locking failure must never take down cron writes — in-process lock still held.
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
                                "proceeding with in-process lock only", e)
-            try:
-                yield
-            finally:
-                if lock_fd is not None:
-                    _release_flock(lock_fd)
+            yield
         finally:
+            if lock_fd is not None:
+                _release_flock(lock_fd)
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
+            _jobs_lock_state.cross_process = False
+            _jobs_lock_state.store_identity = None
 
 
 @contextlib.contextmanager
@@ -2150,6 +2166,187 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
     return _with_job(job_id, apply)
 
 
+def rearm_recurring_future_only(
+    job_id: str, *, request_id: str, expected_revision: str,
+) -> Optional[dict[str, Any]]:
+    """Re-arm under the same tick and per-job fire fences used by scan, claim, and dispatch."""
+    with store_and_dispatch_fence(_current_cron_store().cron_dir):
+        with _fire_job_lock(str(job_id)) as acquired:
+            if not acquired:
+                raise RuntimeError("cannot acquire scheduler/job dispatch fences; rearm refused")
+            return _rearm_recurring_future_only_under_fence(
+                job_id, request_id=request_id, expected_revision=expected_revision
+            )
+
+
+_REARM_BLOCK_MARKER_TEXT = "future-only rearm state not verified\n"
+
+
+def _rearm_dispatch_block_path(job_id: str) -> Path:
+    """Stable per-Job fail-closed marker, isolated from user-controlled Job IDs."""
+    digest = hashlib.sha256(str(job_id).encode("utf-8")).hexdigest()
+    return _current_cron_store().cron_dir / f".rearm-blocked-{digest}"
+
+
+def _rearm_dispatch_is_blocked(job_id: str) -> bool:
+    """Unknown marker state denies dispatch; only definite absence is unblocked."""
+    path = _rearm_dispatch_block_path(job_id)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _set_rearm_dispatch_block(job_id: str) -> None:
+    atomic_write_text(
+        _rearm_dispatch_block_path(job_id), _REARM_BLOCK_MARKER_TEXT,
+        tmp_prefix=".rearm-block_", mode=0o600, fsync_dir=True)
+
+
+def _clear_rearm_dispatch_block(job_id: str) -> None:
+    path = _rearm_dispatch_block_path(job_id)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(info.st_mode) or path.read_text(encoding="utf-8") != _REARM_BLOCK_MARKER_TEXT:
+        raise RuntimeError("future-only rearm dispatch marker is not owned by this operation")
+    path.unlink()
+    fsync_directory(path.parent)
+
+
+def _rearm_recurring_future_only_under_fence(
+    job_id: str, *, request_id: str, expected_revision: str,
+) -> Optional[dict[str, Any]]:
+    """Persist a paused recurring Job at its first strict-future scheduled occurrence."""
+
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise ValueError("request_id is required")
+    if not isinstance(expected_revision, str) or len(expected_revision) != 64:
+        raise ValueError("expected_revision must be the current Job Store SHA-256")
+    with _jobs_lock(strict=True):
+        jobs_file = _current_cron_store().jobs_file
+        raw = jobs_file.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != expected_revision:
+            raise ValueError("Job Store revision changed; Job remains paused")
+        try:
+            data = json.loads(raw.decode("utf-8-sig"))
+            rows = data.get("jobs") if isinstance(data, dict) else data
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Job Store is corrupt; Job remains paused") from exc
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise RuntimeError("Job Store has incompatible schema; Job remains paused")
+        matches = [(index, row) for index, row in enumerate(rows)
+                   if row.get("id") == str(job_id)]
+        if len(matches) != 1:
+            raise ValueError("target Job is missing or duplicated")
+        index, job = matches[0]
+        original_job = dict(job)
+        original_rows = json.loads(raw.decode("utf-8-sig"))
+        original_rows = original_rows.get("jobs") if isinstance(original_rows, dict) else original_rows
+        original_rows = [dict(row) for row in original_rows]
+        if (not isinstance(job.get("schedule"), dict)
+                or job.get("schedule", {}).get("kind") not in {"cron", "interval"}):
+            raise ValueError("future-only rearm requires a valid recurring Job record")
+        schedule = job["schedule"]
+        if job.get("enabled") is not False or job.get("state") != "paused":
+            raise ValueError("target Job must be paused and disabled")
+        if job.get("fire_claim") or job.get("run_claim"):
+            raise ValueError("existing dispatch claim prevents rearm")
+        if _rearm_dispatch_is_blocked(str(job_id)):
+            raise RuntimeError("prior future-only rearm has an unresolved dispatch block")
+        pending = job.get("pending_slot")
+        if pending is not None:
+            # A tick lock alone does not prove a foreign pending owner has relinquished its
+            # lease. Only a well-formed local orphan with no queued worker may be discarded.
+            if (not isinstance(pending, dict)
+                    or _parse_aware(pending.get("scheduled_at")) is None
+                    or _parse_aware(pending.get("at")) is None
+                    or pending.get("by") != _machine_id()
+                    or _job_running_in_this_process(str(job_id))):
+                raise ValueError("unresolved pending dispatch ownership prevents rearm")
+        from cron.executions import nonterminal_execution
+        if nonterminal_execution(str(job_id)) is not None:
+            raise ValueError("nonterminal execution or recovery claim prevents rearm")
+        now = _hermes_now()
+        next_run = compute_next_run(schedule)
+        next_dt = _parse_aware(next_run) if next_run else None
+        if next_dt is None or _instant_at_or_before(next_dt, now):
+            raise ValueError("schedule did not produce a strict-future occurrence")
+        updated = dict(job)
+        updated.update(enabled=True, state="scheduled", paused_at=None,
+                       paused_reason=None, next_run_at=next_run,
+                       rearm_generation=uuid.uuid4().hex,
+                       rearm_admission={"request_id": request_id, "first_slot": next_run,
+                                        "token": uuid.uuid4().hex})
+        updated.pop("pending_slot", None)
+        rows[index] = updated
+        expected_active_job = dict(updated)
+        try:
+            # Persist the admission barrier BEFORE enabling. Scheduler scans and fire claims
+            # consult it, so even an ambiguous rollback failure after os.replace cannot run this Job.
+            _set_rearm_dispatch_block(str(job_id))
+            from cron.rearm_admission import publication
+            with publication(_current_cron_store().cron_dir, expected_active_job):
+                _save_jobs_unlocked(rows)
+                persisted_rows = _peek_jobs_unlocked()
+                if persisted_rows is None:
+                    raise RuntimeError("Job Store readback is corrupt; rearm result is uncertain")
+                persisted_matches = [row for row in persisted_rows if row.get("id") == str(job_id)]
+                persisted = persisted_matches[0] if len(persisted_matches) == 1 else None
+                persisted_next = _parse_aware(persisted.get("next_run_at")) if persisted else None
+                if (persisted != expected_active_job or persisted.get("enabled") is not True
+                        or persisted.get("state") != "scheduled"
+                        or persisted.get("pending_slot") is not None
+                        or persisted_next is None
+                        or _instant_at_or_before(persisted_next, now)):
+                    raise RuntimeError("future-only rearm readback failed")
+                result = _normalize_job_record(persisted)
+                _clear_rearm_dispatch_block(str(job_id))
+            return result
+        except BaseException:
+            # Keep the tick lock, fire fence and Job Store lock continuously through rollback;
+            # no scheduler or provider claim can observe the temporary active record.
+            try:
+                # Admission publication has rolled back before compensating Job Store I/O.
+                # No marker rewrite or successful pause is needed to deny this generation.
+                current = _peek_jobs_unlocked()
+                if current is None:
+                    raise RuntimeError("cannot verify failed rearm rollback")
+                current_index = next((i for i, item in enumerate(current)
+                                      if str(item.get("id")) == str(job_id)), None)
+                prior = next((item for item in original_rows
+                              if str(item.get("id")) == str(job_id)), None)
+                if prior is None or current_index is None:
+                    raise RuntimeError("failed rearm rollback state is uncertain")
+                current_target = current[current_index]
+                if current_target == original_job:
+                    rollback_needed = False
+                elif current_target == expected_active_job:
+                    rollback_needed = True
+                else:
+                    raise RuntimeError("failed rearm rollback state is uncertain")
+                if rollback_needed:
+                    current[current_index] = dict(prior)
+                    _save_jobs_unlocked(current)
+                    verified = _peek_jobs_unlocked()
+                    if verified is None:
+                        raise RuntimeError("failed rearm rollback readback is uncertain")
+                    final = next((item for item in verified
+                                  if str(item.get("id")) == str(job_id)), None)
+                    if final is None or final.get("enabled") is not False \
+                            or final.get("state") != "paused":
+                        raise RuntimeError("failed rearm rollback left Job state uncertain")
+                _clear_rearm_dispatch_block(str(job_id))
+            except BaseException as rollback_error:
+                raise RuntimeError(
+                    "future-only rearm failed and durable Job state is uncertain; do not dispatch"
+                ) from rollback_error
+            raise
+
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)
@@ -2736,6 +2933,8 @@ def _machine_id() -> str:
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False,
     manual: bool = False, return_job: bool = False,
+    expected_scheduled_instant: Optional[str] = None,
+    expected_rearm_generation: Any = _MISSING,
 ) -> bool | dict[str, Any]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
@@ -2747,8 +2946,33 @@ def claim_job_for_fire(
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
     ``next_run_at`` so a stale re-delivery cannot re-fire."""
     def apply(jobs, _i, job):
+        if _rearm_dispatch_is_blocked(str(job_id)):
+            return False
+        from cron.rearm_admission import admitted
+        if not admitted(_current_cron_store().cron_dir, job):
+            return False
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
+        if (expected_rearm_generation is not _MISSING
+                and job.get("rearm_generation") != expected_rearm_generation):
+            return False
+        if (expected_scheduled_instant is not None
+                and job.get("schedule", {}).get("kind") in {"cron", "interval"}):
+            # A due-scan snapshot can wait in the executor queue while a future-only rearm
+            # deliberately clears its pending occurrence. Never let that stale snapshot claim
+            # the now-active Job after rearm. Both operations share _fire_job_lock.
+            from cron.occurrences import scheduled_instant as canonical_instant
+            pending = job.get("pending_slot")
+            if not isinstance(pending, dict):
+                # Existing non-rearm recovery paths may advance next_run_at while preserving the
+                # current due identity (for example stale-error/self-heal). They have no pending
+                # slot to compare; retain the existing claim contract.
+                pass
+            else:
+                pending_instant = canonical_instant(pending.get("scheduled_at"))
+                if (pending_instant is None
+                        or pending_instant != canonical_instant(expected_scheduled_instant)):
+                    return False
         # Both enabled and pause markers must clear — a half-paused record must not claim. ``force``
         # (Trigger-now on a paused job) bypasses the gate and atomically resumes the job below.
         if not force and not is_job_runnable(job):
@@ -3268,12 +3492,22 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         return False
     if kind == "cron" and not manual_run and _repair_timezone_shifted_cron(d):
         return False
+    previous_next_run = d.job.get("next_run_at")
     d.next_run_dt = _rearm_stale_error_recurring(d)
+    if d.job.get("next_run_at") != previous_next_run:
+        # The persisted-error recovery can replace a parked future instant with the legal fire
+        # being re-armed now. Every downstream occurrence identity and pending_slot must describe
+        # that recovered instant, not the stale parked value captured at scan entry.
+        next_run = str(d.job["next_run_at"])
+        d.next_run = next_run
+        d.raw_next_run_dt = datetime.fromisoformat(next_run)
+        d.next_run_dt = _ensure_aware(d.raw_next_run_dt)
     if _instant_after(d.next_run_dt, now):
         return False
 
     # Only the dispatch snapshot carries this field; never infer it from a later stamp.
     job["_scheduled_instant"] = None if manual_run else scheduled_instant(job.get("next_run_at"))
+    job["_rearm_generation"] = job.get("rearm_generation")
 
     if not manual_run and kind == "cron" and _reanchor_stale_cron(d):
         return False
@@ -3337,6 +3571,11 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
         # run/persist.
         try:
             if is_terminal_job(job) and not _is_recoverable_error_job(job):
+                continue
+            if _rearm_dispatch_is_blocked(str(job.get("id", ""))):
+                continue
+            from cron.rearm_admission import admitted
+            if not admitted(_current_cron_store().cron_dir, job):
                 continue
             if not job.get("enabled", True):
                 continue

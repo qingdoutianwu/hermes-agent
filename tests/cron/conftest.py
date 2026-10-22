@@ -14,6 +14,30 @@ inside the test, which overrides this fixture's value for that scope.
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _skip_unrelated_checkout_update_recovery(monkeypatch):
+    """Cron tests must not probe linked-worktree update metadata at import time.
+
+    These tests exercise Cron behavior, not interrupted source-update recovery. Hermes' bootstrap
+    invokes that recovery before importing its runtime, and a linked worktree stores its Git
+    metadata under the operator's guarded ~/.hermes root. Keep the real-home guard active; replace
+    only the unrelated recovery probe for this test scope.
+    """
+    from hermes_cli import _early_recovery
+    from pm import environments
+    from tools.environments import local
+
+    monkeypatch.setattr(_early_recovery, "restore_interrupted_pull", lambda *_args, **_kwargs: False)
+    # scripts/run_tests.sh has already selected this checkout's isolated test environment.
+    # Re-activating via hermes_bootstrap probes an install manifest beside the checkout, which
+    # is outside the disposable test HOME for linked worktrees.
+    monkeypatch.setattr(environments, "activate_dependencies", lambda *_args, **_kwargs: None)
+    # Cron behavior tests do not verify the console-script discovery policy. Its source-checkout
+    # fallback probes <checkout-parent>/manifest.json, which can be under guarded ~/.hermes for a
+    # linked Hermes worktree; resolver behavior has dedicated tools/environment tests.
+    monkeypatch.setattr(local, "_resolve_hermes_bin_dir", lambda: None)
+
+
 @pytest.fixture()
 def make_cron_provider():
     """Factory for minimal CronScheduler test doubles.

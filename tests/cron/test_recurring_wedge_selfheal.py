@@ -105,9 +105,7 @@ class TestStaleInflightSelfHeal:
         latest = E.latest_execution(job_id)
         assert job_id not in S.get_running_job_ids(), "stale claim must be released"
         assert latest is not None, "wedged job must create an execution"
-        assert latest["status"] == "completed", (
-            "wedged job must fire again without force-run"
-        )
+        assert latest["status"] == "completed", f"latest={latest!r}; job={J.get_job(job_id)!r}"
 
 
     def test_guard_stats_reported(self, cron_env, monkeypatch):

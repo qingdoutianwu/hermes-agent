@@ -111,7 +111,7 @@ class TestPersistedStaleErrorRecovery:
         assert latest is not None, (
             "wedged stale-error job must be re-dispatched without force-run"
         )
-        assert latest["status"] == "completed"
+        assert latest["status"] == "completed", f"expected successful run, row={latest!r}"
         # The recovery must be countable / probe-visible.
         from cron import jobs as Jmod
         stats = Jmod.get_persisted_error_recovery_stats()

@@ -4242,7 +4242,14 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
     # Claim only when the worker actually starts, so a queued lease can't expire first.
     try:
-        claimed = claim_job_for_fire(job["id"], return_job=True)
+        claim_kwargs: dict[str, Any] = {"return_job": True}
+        expected_scheduled_instant = job.get("_scheduled_instant")
+        expected_rearm_generation = job.get("_rearm_generation", None)
+        if expected_scheduled_instant is not None:
+            claim_kwargs["expected_scheduled_instant"] = expected_scheduled_instant
+        if "_rearm_generation" in job:
+            claim_kwargs["expected_rearm_generation"] = expected_rearm_generation
+        claimed = claim_job_for_fire(job["id"], **claim_kwargs)
     except OSError as exc:
         store_health.note_unwritable(exc, f"skipped job '{job.get('name') or job['id']}'", "claim", [job])
         settle_unstarted_execution(

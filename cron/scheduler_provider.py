@@ -201,29 +201,35 @@ class CronScheduler(ABC):
         """Durably claim one fire + create its audit attempt. Transports call this synchronously
         before acknowledging, then pass the exact snapshot to ``fire_claimed`` off-thread."""
         from cron.executions import create_execution, finish_execution, set_execution_occurrence
-        from cron.jobs import claim_job_for_fire
+        from cron.jobs import _fire_job_lock, claim_job_for_fire
 
-        execution = create_execution(job_id, source=self.name)
         claim_kwargs = {"return_job": True}
         if force:
             claim_kwargs["force"] = True
         if manual:
             claim_kwargs["manual"] = True
-        try:
-            claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
-            if isinstance(claimed_job, dict):
-                set_execution_occurrence(execution["id"], claimed_job.get("_scheduled_instant"))
-        except BaseException as exc:
-            finish_execution(
-                execution["id"], success=False,
-                error=f"Fire claim failed before dispatch: {type(exc).__name__}: {exc}",
-            )
-            raise
-        if not isinstance(claimed_job, dict):
-            finish_execution(execution["id"], success=False, error="Fire claim was not acquired")
-            return None
-        claimed_job["execution_id"] = execution["id"]
-        return claimed_job
+        with _fire_job_lock(str(job_id)) as acquired:
+            if not acquired:
+                raise RuntimeError("Cron fire fence unavailable; provider claim refused")
+            # The execution ledger create and Job Store claim form one ownership admission
+            # against future-only rearm. Otherwise rearm can pass its ledger check just before
+            # this provider creates a claim, then the stale provider callback wins after rearm.
+            execution = create_execution(job_id, source=self.name)
+            try:
+                claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
+                if isinstance(claimed_job, dict):
+                    set_execution_occurrence(execution["id"], claimed_job.get("_scheduled_instant"))
+            except BaseException as exc:
+                finish_execution(
+                    execution["id"], success=False,
+                    error=f"Fire claim failed before dispatch: {type(exc).__name__}: {exc}",
+                )
+                raise
+            if not isinstance(claimed_job, dict):
+                finish_execution(execution["id"], success=False, error="Fire claim was not acquired")
+                return None
+            claimed_job["execution_id"] = execution["id"]
+            return claimed_job
 
     def fire_claimed(
         self, claimed_job: dict, *, adapters: Any = None, loop: Any = None,
@@ -288,6 +294,23 @@ def _misfire_grace_minutes() -> float:
         )
     except Exception:
         return float(DEFAULT_MISFIRE_GRACE_MINUTES)
+
+
+def _claim_overdue_snapshot(provider, snapshot):
+    """Bind the backstop's scanned intent to admission under the native fire/store fences."""
+    from cron.jobs import _fire_job_lock, _jobs_lock, get_job
+
+    job_id = str(snapshot["id"])
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return None
+        with _jobs_lock(strict=True):
+            current = get_job(job_id)
+            if (current is None
+                    or current.get("rearm_generation") != snapshot.get("rearm_generation")
+                    or current.get("next_run_at") != snapshot.get("next_run_at")):
+                return None
+            return provider.claim_fire(job_id)
 
 
 def fire_overdue_jobs(
@@ -367,7 +390,7 @@ def fire_overdue_jobs(
         )
         try:
             # Claim synchronously (CAS loss = external retry beat us), run off-thread: never block.
-            claimed = provider.claim_fire(job_id)
+            claimed = _claim_overdue_snapshot(provider, job)
             if claimed is None:
                 continue
             threading.Thread(

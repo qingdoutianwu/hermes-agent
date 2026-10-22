@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from concurrent.futures import Future
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -43,6 +44,7 @@ from cron.jobs import (
     remove_job,
     resolve_job_ref,
     resume_job,
+    rearm_recurring_future_only,
     trigger_job,
     update_job)
 from tools.cronjob_prompt_scan import _scan_cron_prompt
@@ -960,7 +962,19 @@ _JOB_ACTIONS = {
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
     "pause": lambda job, a: _job_state_result(pause_job(job["id"], reason=a["reason"])),
     "resume": lambda job, a: _job_state_result(resume_job(job["id"])),
+    "resume_future_only": lambda job, a: _action_resume_future_only(job),
 }
+
+
+def _action_resume_future_only(job: dict[str, Any]) -> str:
+    from cron.jobs import _current_cron_store
+
+    revision = hashlib.sha256(_current_cron_store().jobs_file.read_bytes()).hexdigest()
+    updated = rearm_recurring_future_only(
+        job["id"], request_id=f"cronjob-tool:{job['id']}", expected_revision=revision)
+    if updated is None:
+        return tool_error("Target Job was not found; it remains unchanged.", success=False)
+    return _job_state_result(updated)
 
 
 def _resolve_job_or_error(job_id: str):
@@ -1067,7 +1081,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, update, pause, resume, resume_future_only, remove, run. resume_future_only only resumes a paused recurring job at its next future schedule slot and refuses changed Job Store state. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
             },
             "job_id": {
                 "type": "string",

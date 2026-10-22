@@ -539,6 +539,17 @@ def live_inflight_execution(job_id: str) -> Optional[dict[str, Any]]:
     return record
 
 
+def nonterminal_execution(job_id: str) -> Optional[dict[str, Any]]:
+    """Return any execution record not explicitly terminal; unknown states fail closed."""
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM executions WHERE job_id=? AND status NOT IN ('completed','failed') "
+            "ORDER BY julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT 1",
+            (str(job_id),),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
 def latest_executions(job_ids: list[str]) -> dict[str, dict[str, Any]]:
     """Load latest execution for many jobs in one query."""
     clean = [str(job_id) for job_id in dict.fromkeys(job_ids) if job_id]

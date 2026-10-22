@@ -84,6 +84,24 @@ def test_rename_cannot_overwrite_a_protected_destination(protected_home, tmp_pat
     assert source.read_text(encoding="utf-8") == "external"
 
 
+def test_only_absent_checkout_payload_manifest_probe_is_allowed(tmp_path, monkeypatch):
+    from tests.home_io_guard import HomeIOGuard
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    checkout = home / "workspaces" / "repo"
+    checkout.mkdir(parents=True)
+    probe = checkout.parent / "manifest.json"
+    guard = HomeIOGuard(lambda: [home], checkout_root=checkout)
+    guard.check(probe, metadata=True)  # exact absent PM discovery probe
+    assert not probe.exists()
+
+    probe.write_text("{}", encoding="utf-8")
+    guard = HomeIOGuard(lambda: [home], checkout_root=checkout)
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(probe, metadata=True)
+
+
 def test_installed_desktop_app_can_be_read_but_never_changed(tmp_path, monkeypatch):
     from tests import conftest
 
