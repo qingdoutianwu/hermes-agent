@@ -645,6 +645,35 @@ def _interpret_browser_command_output(command: str, stdout: str, stderr: str, re
     return parsed
 
 
+def navigation_receipt(task_id: str, info: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    """Project only explicit backend document fields, never infer them from open success.
+
+    This is propagation, not a new event collector. Until the backend supplies
+    authenticated document/transport events, proof remains UNPROVEN even when
+    individual reported fields exist. No proxy configuration is read here.
+    """
+    import re
+
+    def identifier(name):
+        value = data.get(name)
+        return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", value) else None
+
+    status = data.get("final_http_status")
+    completion = data.get("request_completion")
+    redirects = data.get("redirect_chain_status")
+    return {"schema": "hermes-browser-navigation-v1", "task_id": task_id,
+            "execution_id": None, "execution_identity": "UNAVAILABLE",
+            "session_id": info.get("session_name"),
+            "navigation_id": identifier("navigation_id"),
+            "main_document_request_id": identifier("main_document_request_id"),
+            "final_http_status": status if type(status) is int and 100 <= status <= 599 else None,
+            "redirect_chain_status": redirects if redirects in ("NONE", "COMPLETE", "FAILED") else None,
+            "request_completion": completion if completion in ("COMPLETED", "FAILED") else None,
+            "field_origin": "BACKEND_REPORTED_METADATA_NOT_EVENT_PROOF",
+            "main_document_proof": "UNPROVEN", "proxy_correlation": "UNPROVEN",
+            "failure_reason": "BACKEND_DOCUMENT_TRANSPORT_EVENTS_UNAVAILABLE"}
+
+
 _SANDBOX_AGENT_BROWSER = "agent-browser"  # the CLI baked into nousresearch/hermes-sandbox:desktop
 _SANDBOX_ENV_KEYS = ("AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_IDLE_TIMEOUT_MS", "AGENT_BROWSER_ARGS",
                      "AGENT_BROWSER_PROFILE", "AGENT_BROWSER_EXECUTABLE_PATH", "AGENT_BROWSER_HEADED",

@@ -788,6 +788,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         return blocked
 
     response = {"success": True, "url": final_url, "title": title}
+    response["navigation_receipt"] = _session.navigation_receipt(effective_task_id, session_info, data)
     features = session_info.get("features") or {}
     if features.get("real_profile"):  # auditability: this ran on the user's real-profile copy-browser
         response["used_real_profile"] = True

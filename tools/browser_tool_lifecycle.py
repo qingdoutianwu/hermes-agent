@@ -4,6 +4,8 @@ Split out of ``tools/browser_tool.py``. Facade-owned state is read through ``_bt
 """
 
 import contextlib
+import hashlib
+import json
 import os
 import shutil
 import signal
@@ -615,7 +617,7 @@ def _drop_last_active_binding(task_id: str) -> None:
         _bt._last_active_session_key.pop(bare_task_id, None)
 
 
-def cleanup_browser(task_id: Optional[str] = None) -> None:
+def cleanup_browser(task_id: Optional[str] = None) -> dict[str, Any]:
     """Clean up browser session(s) for a task: a bare task id reaps BOTH the primary
     session and any hybrid local sidecar; a ``::local`` key reaps only that one."""
     if task_id is None:
@@ -626,9 +628,13 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     with _bt._cleanup_lock:
         if not _bt._is_local_sidecar_key(task_id) and sidecar_key in _bt._active_sessions:
             session_keys.append(sidecar_key)
-    for session_key in session_keys:
-        _cleanup_single_browser_session(session_key)
-    _drop_last_active_binding(task_id)
+    receipts = [_cleanup_single_browser_session(key) for key in session_keys]
+    if not any(r.get("ownership") == "REJECTED" for r in receipts):
+        _drop_last_active_binding(task_id)
+    return {"schema": "hermes-browser-cleanup-v1", "task_id": task_id,
+            "execution_id": None, "execution_identity": "UNAVAILABLE",
+            "sessions": receipts, "exit_proof": "UNPROVEN",
+            "status": "FAILED" if any(r["status"] == "FAILED" for r in receipts) else "UNPROVEN"}
 
 
 def _kill_verified_daemon(socket_dir: str, session_name: str) -> bool:
@@ -694,8 +700,41 @@ def _force_reap_browser_session(task_id: str) -> None:
     _drop_last_active_binding(task_id)
 
 
-def _cleanup_single_browser_session(task_id: str) -> None:
+def _cleanup_receipt(task_id: str, info: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Task routing is not Scheduler authentication or a process-exit event."""
+    info = info or {}
+    owner = _bt._bare_task_id_for_session_key(task_id)
+    rejected = (info.get("owner_task_id", owner) != owner
+                or info.get("session_key", task_id) != task_id)
+    verified = info.get("owner_task_id") == owner and info.get("session_key") == task_id
+    return {"schema": "hermes-browser-session-cleanup-v1", "task_id": task_id,
+            "execution_id": None, "execution_identity": "UNAVAILABLE",
+            "session_id": info.get("session_name"), "close_object": "SESSION",
+            "ownership": "REJECTED" if rejected else "VERIFIED_TASK_BINDING" if verified else "UNVERIFIED",
+            "close_method_invoked": False, "close_dispatched": None, "close_result": None,
+            "native_cleanup_completed": False, "exit_proof": "UNPROVEN",
+            "process_identity": None, "status": "FAILED" if rejected else "UNPROVEN",
+            "failure_reason": "SESSION_OWNERSHIP_MISMATCH" if rejected else "NATIVE_EXIT_EVENT_UNAVAILABLE"}
+
+
+def _close_result_receipt(value: Any) -> dict[str, Any]:
+    """Retain actual ACK/failure identity without exporting error text or secrets."""
+    data = value.get("data") if isinstance(value, dict) else None
+    success = value.get("success") if isinstance(value, dict) else None
+    closed = data.get("closed") if isinstance(data, dict) else None
+    return {"success": success if type(success) is bool else None,
+            "reported_closed": closed if type(closed) is bool else None,
+            "result_sha256": hashlib.sha256(json.dumps(value, sort_keys=True,
+                                                       default=str).encode()).hexdigest()}
+
+
+def _cleanup_single_browser_session(task_id: str) -> dict[str, Any]:
     """Reap a single browser session by its exact session key."""
+    with _bt._cleanup_lock:
+        session_info = _bt._active_sessions.get(task_id)
+    receipt = _cleanup_receipt(task_id, session_info)
+    if receipt["ownership"] == "REJECTED":
+        return receipt
     _cdp._stop_cdp_supervisor(task_id)  # close our WebSocket BEFORE the backend tears down the endpoint
 
     # Camofox: managed persistence keeps the profile (cookies) across tasks; skip the full
@@ -710,16 +749,24 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     _bt.logger.debug("cleanup_browser called for task_id: %s", task_id)
     _bt.logger.debug("Active sessions: %s", list(_bt._active_sessions.keys()))
 
-    # Look up but don't remove yet — _run_browser_command needs the entry for ``close``.
+    # Do not follow a replacement generation during teardown.
     with _bt._cleanup_lock:
-        session_info = _bt._active_sessions.get(task_id)
+        if _bt._active_sessions.get(task_id) is not session_info:
+            receipt.update(status="FAILED", failure_reason="SESSION_CHANGED_BEFORE_CLOSE")
+            return receipt
 
     if not session_info:
         _bt.logger.debug("No active session found for task_id: %s", task_id)
-        return
+        receipt["failure_reason"] = "SESSION_NOT_TRACKED_EXIT_UNPROVEN"
+        return receipt
 
     _bt.logger.debug("Found session for task %s: bb_session_id=%s", task_id, session_info.get("bb_session_id", "unknown"))
     _bt._maybe_stop_recording(task_id)  # saves the file before close
+    with _bt._cleanup_lock:
+        if (_bt._active_sessions.get(task_id) is not session_info
+                or _cleanup_receipt(task_id, session_info)["ownership"] == "REJECTED"):
+            receipt.update(status="FAILED", failure_reason="SESSION_CHANGED_BEFORE_CLOSE")
+            return receipt
 
     # Lightpanda sessions have no daemon to ``close``; an expired cloud CDP URL cannot
     # accept one and would make _get_session_info() renew the session mid-cleanup.
@@ -733,13 +780,30 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         _bt.logger.debug("Skipping agent-browser close for expired session %s", task_id)
     else:
         try:
-            _session._run_browser_command(task_id, "close", [], timeout=10)
+            receipt["close_method_invoked"] = True
+            close_result = _session._run_browser_command(task_id, "close", [], timeout=10)
+            receipt["close_result"] = _close_result_receipt(close_result)
+            if receipt["close_result"]["success"] is not True:
+                receipt.update(status="FAILED", failure_reason="NATIVE_CLOSE_NOT_ACKNOWLEDGED")
             _bt.logger.debug("agent-browser close command completed for task %s", task_id)
         except Exception as e:
+            receipt.update(status="FAILED", failure_reason="NATIVE_CLOSE_EXCEPTION",
+                           close_error_class=type(e).__name__)
             _bt.logger.warning("agent-browser close failed for task %s: %s", task_id, e)
 
-    _release_session_resources(task_id, session_info)
+    with _bt._cleanup_lock:
+        if _bt._active_sessions.get(task_id) is not session_info:
+            receipt.update(status="FAILED", failure_reason="SESSION_CHANGED_DURING_CLOSE")
+            return receipt
+    try:
+        _release_session_resources(task_id, session_info)
+    except Exception as exc:
+        receipt.update(status="FAILED", failure_reason="NATIVE_RESOURCE_RELEASE_FAILED",
+                       cleanup_error_class=type(exc).__name__)
+        return receipt
+    receipt["native_cleanup_completed"] = True
     _bt.logger.debug("Removed task %s from active sessions", task_id)
+    return receipt
 
 
 def cleanup_all_browsers() -> None:
